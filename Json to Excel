@@ -1,0 +1,431 @@
+import re, json, argparse
+from pathlib import Path
+from typing import Any, Dict, List, Tuple, Set, Union, Optional
+
+import pandas as pd
+import numpy as np
+
+
+PM_PAT = re.compile(r"^\s*([+-]?\d+(?:\.\d+)?)\s*(?:±|\+/-|\+\/-)\s*(\d+(?:\.\d+)?)\s*$")
+RANGE_PAT = re.compile(r"^\s*([+-]?\d+(?:\.\d+)?)\s*[–\-~―]\s*([+-]?\d+(?:\.\d+)?)\s*$")
+NUM_PAT = re.compile(r"([+-]?\d+(?:\.\d+)?)")
+PCT_IN_TEXT = re.compile(r"(\d+(?:\.\d+)?)\s*%")
+
+
+def _to_float(s: Any) -> Optional[float]:
+    if s is None:
+        return None
+    if isinstance(s, (int, float)):
+        return float(s)
+    text = str(s).strip()
+    if not text:
+        return None
+    m = PM_PAT.match(text.replace("+/-", "±"))
+    if m:
+        return float(m.group(1))
+    m = RANGE_PAT.match(text)
+    if m:
+        a, b = float(m.group(1)), float(m.group(2))
+        return (a + b) / 2.0
+    m = NUM_PAT.search(text)
+    if m:
+        try:
+            return float(m.group(1))
+        except:
+            return None
+    return None
+
+
+def _pct_to_float(p: Any) -> Optional[float]:
+    if p is None: return None
+    if isinstance(p, (int, float)): return float(p)
+    text = str(p).strip()
+    m = PCT_IN_TEXT.search(text)
+    if m:
+        try:
+            return float(m.group(1))
+        except:
+            pass
+    return _to_float(text)
+
+
+def _hours_to_float(h: Any) -> Optional[float]:
+    if h is None: return None
+    if isinstance(h, (int, float)): return float(h)
+    t = str(h).lower().strip()
+    if "min" in t:
+        v = _to_float(t);
+        return v / 60.0 if v is not None else None
+    if "h" in t:
+        v = _to_float(t);
+        return v
+    return _to_float(t)
+
+
+def _celsius_to_float(t: Any) -> Optional[float]:
+    if t is None: return None
+    if isinstance(t, (int, float)): return float(t)
+    return _to_float(t)
+
+
+def _size_to_um(val_in_text: Any) -> Optional[float]:
+    if val_in_text is None: return None
+    t = str(val_in_text).lower().strip()
+
+
+    if " to " in t:
+        parts = t.split(" to ")
+        if len(parts) == 2:
+            v1 = _size_to_um(parts[0])
+            v2 = _size_to_um(parts[1])
+            if v1 is not None and v2 is not None:
+                return (v1 + v2) / 2.0
+
+    v = _to_float(t)
+    if v is None: return None
+
+    if "nm" in t:
+        return v / 1000.0
+    elif "lm" in t or "μm" in t or "um" in t:
+        return v
+    elif "mm" in t:
+        return v * 1000.0
+    else:
+        return v
+
+
+def _safe_str(x: Any) -> str:
+    if x is None: return ""
+    if isinstance(x, (list, tuple)):
+        return "; ".join([_safe_str(i) for i in x])
+    return str(x)
+
+
+def _reduction_from_detail(detail: Any) -> Optional[float]:
+    if not detail: return None
+    t = str(detail)
+    ps = [float(m.group(1)) for m in PCT_IN_TEXT.finditer(t)]
+    if not ps: return None
+    remain = 1.0
+    for p in ps:
+        remain *= (1.0 - p / 100.0)
+    total = (1.0 - remain) * 100.0
+    return round(total, 2)
+
+
+PHASE_SYNONYMS: Dict[str, str] = {
+    "γ'": "L12", "gamma'": "L12", "gammaprime": "L12", "gamma prime": "L12",
+    "orderedfcc": "L12", "ordered-fcc": "L12",
+    "orderedbcc": "B2", "ordered-bcc": "B2",
+    "heusler": "L21",
+    "eta": "Ni3Ti", "η": "Ni3Ti", "ni3ti": "Ni3Ti", "g-ni3ti": "Ni3Ti",
+    "sigma": "σ", "sigmaphase": "σ",
+    "laves": "Laves", "c14": "Laves", "c15": "Laves", "c36": "Laves",
+    "g": "γ",
+}
+BASIC_UPPER = {"FCC", "BCC", "HCP", "B2", "L12", "L21", "γ", "Ni3Ti"}
+
+
+def std_phase_name(name: str) -> str:
+    n = (name or "").strip()
+    if not n: return ""
+    key = n.lower().replace("–", "-").replace("—", "-").replace(" ", "")
+    if key in PHASE_SYNONYMS: return PHASE_SYNONYMS[key]
+    upper = n.upper()
+    if upper in BASIC_UPPER: return upper
+    return n
+
+
+TARGET_PHASE_AGG = ["FCC", "BCC", "HCP", "B2", "L12", "L21", "γ", "Ni3Ti"]
+
+
+def load_all_json(json_dir: Union[str, Path]) -> List[Tuple[str, Dict[str, Any]]]:
+    json_dir = Path(json_dir)
+    items: List[Tuple[str, Dict[str, Any]]] = []
+    for p in sorted(json_dir.glob("*.json")):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"Read failed: {p.name} -> {e}")
+            continue
+        if isinstance(data, dict):
+            items.append((p.name, data))
+        elif isinstance(data, list):
+            for obj in data:
+                if isinstance(obj, dict):
+                    items.append((p.name, obj))
+        else:
+            print(f"Skipped non-object JSON: {p.name}")
+    return items
+
+
+def gather_elements(objs: List[Dict[str, Any]]) -> List[str]:
+    elems: Set[str] = set()
+    for obj in objs:
+        comp = obj.get("composition", {})
+        if isinstance(comp, dict):
+            for k in comp.keys():
+                if k not in {"_unit", "_source"}:
+                    elems.add(k)
+    return sorted(elems)
+
+
+def get_phases_array(obj: Dict[str, Any]) -> List[Dict[str, Any]]:
+    for key in ["phases", "phase", "microstructure", "microstructures"]:
+        if key in obj:
+            x = obj.get(key)
+            if isinstance(x, dict): return [x]
+            if isinstance(x, list): return [i for i in x if isinstance(i, dict)]
+    return []
+
+
+def flatten_record(obj: Dict[str, Any],
+                   elem_cols: List[str],
+                   src_file: str,
+                   rec_idx: int) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    row: Dict[str, Any] = {
+        "src": src_file,
+        "idx": rec_idx,
+        "name": obj.get("alloy_name", ""),
+        "cond": obj.get("condition", ""),
+
+        "dproc": obj.get("Deformation Process", ""),
+        "dtemp": obj.get("Deformation Temperature", ""),
+        "ddetail": obj.get("Deformation Detail", ""),
+        "h1proc": obj.get("Heat Treatment Process1", ""),
+        "h1time": obj.get("Heat Treatment Time1", ""),
+        "h1temp": obj.get("Heat Treatment Temperature1", ""),
+        "h2proc": obj.get("Heat Treatment Process2", ""),
+        "h2time": obj.get("Heat Treatment Time2", ""),
+        "h2temp": obj.get("Heat Treatment Temperature2", ""),
+        "cool": obj.get("Cooling", ""),
+        "alias": _safe_str(obj.get("alias", "")),
+        "remarks": obj.get("remarks", ""),
+    }
+
+
+    row["dT"] = _celsius_to_float(obj.get("Deformation Temperature"))
+    row["dR"] = _reduction_from_detail(obj.get("Deformation Detail"))
+    row["T1"] = _celsius_to_float(obj.get("Heat Treatment Temperature1"))
+    row["t1"] = _hours_to_float(obj.get("Heat Treatment Time1"))
+    row["T2"] = _celsius_to_float(obj.get("Heat Treatment Temperature2"))
+    row["t2"] = _hours_to_float(obj.get("Heat Treatment Time2"))
+
+
+    comp = obj.get("composition", {})
+    row["cunit"] = comp.get("_unit", "") if isinstance(comp, dict) else ""
+    row["csrc"] = comp.get("_source", "") if isinstance(comp, dict) else ""
+    for e in elem_cols:
+        v = comp.get(e, None) if isinstance(comp, dict) else None
+        row[f"e{e}"] = None if v in (None, "") else float(v)
+
+
+    mech = obj.get("mechanical", {})
+    row["y"] = _to_float(mech.get("yield"))
+    row["uts"] = _to_float(mech.get("uts"))
+    row["uel"] = _to_float(mech.get("uniform_elongation"))
+    row["tel"] = _to_float(mech.get("total_elongation"))
+
+
+    phases_rows: List[Dict[str, Any]] = []
+    phases = get_phases_array(obj)
+
+    agg_pct: Dict[str, float] = {p: 0.0 for p in TARGET_PHASE_AGG}
+    agg_sz_um: Dict[str, Optional[float]] = {p: None for p in TARGET_PHASE_AGG}
+
+    for j, ph in enumerate(phases):
+        name_raw = ph.get("name", "")
+        std = std_phase_name(name_raw)
+
+
+        vol_val = ph.get("vol_pct", ph.get("vol"))
+        p_raw = _safe_str(vol_val)
+        p_val = _pct_to_float(p_raw)
+
+        sz_raw = _safe_str(ph.get("size"))
+        sz_um = _size_to_um(sz_raw) if sz_raw else None
+
+        pr: Dict[str, Any] = {
+            "src": src_file,
+            "idx": rec_idx,
+            "pidx": j,
+            "name": name_raw,
+            "std": std,
+            "praw": p_raw,
+            "p": p_val,
+            "szraw": sz_raw,
+            "szum": sz_um,
+            "a": _safe_str(ph.get("a_nm")),
+            "b": _safe_str(ph.get("b_nm", "")),
+            "c": _safe_str(ph.get("c_nm", "")),
+            "morph": _safe_str(ph.get("morphology", "")),
+            "dist": _safe_str(ph.get("distribution", "")),
+            "matrix": _safe_str(ph.get("matrix", "")),
+            "note": _safe_str(ph.get("note", "")),
+        }
+        phases_rows.append(pr)
+
+        if std in agg_pct and p_val is not None:
+            agg_pct[std] += float(p_val)
+        if std in agg_sz_um and agg_sz_um[std] is None and sz_um is not None:
+            agg_sz_um[std] = sz_um
+
+
+    for ph in TARGET_PHASE_AGG:
+        ph_clean = ph.replace("γ", "gamma").replace("Ni3Ti", "Ni3Ti")
+        row[f"P{ph_clean}"] = agg_pct.get(ph, 0.0) if phases else None
+        row[f"S{ph_clean}"] = agg_sz_um.get(ph, None) if phases else None
+
+    return row, phases_rows
+
+
+def build_ml_df(rec_df: pd.DataFrame) -> pd.DataFrame:
+    id_cols = [c for c in ["src", "idx", "name", "cond"] if c in rec_df.columns]
+
+    keep_prefixes = (
+            ["e"] +
+            ["dT", "dR", "T1", "t1", "T2", "t2"] +
+            ["P", "S"]
+    )
+    keep_cols = []
+    for col in rec_df.columns:
+        if any(col == p or col.startswith(p) for p in keep_prefixes):
+            keep_cols.append(col)
+
+
+    for k in ["y", "uts", "uel", "tel"]:
+        if k in rec_df.columns:
+            keep_cols.append(k)
+
+    ml_df = rec_df[id_cols + keep_cols].copy()
+
+
+    num_cols = [c for c in keep_cols if c not in ("name", "cond")]
+    for col in num_cols:
+        ml_df[col] = pd.to_numeric(ml_df[col], errors="coerce")
+    ml_df[num_cols] = ml_df[num_cols].fillna(0.0)
+    return ml_df
+
+
+def df_to_json_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    def to_native(x):
+        if pd.isna(x): return None
+        if isinstance(x, (np.floating, np.float32, np.float64)): return float(x)
+        if isinstance(x, (np.integer, np.int32, np.int64)): return int(x)
+        return x
+
+    out = []
+    for _, row in df.iterrows():
+        d = {k: to_native(v) for k, v in row.to_dict().items()}
+        out.append(d)
+    return out
+
+
+def main(json_dir: str,
+         out_all_xlsx: str,
+         out_ml_xlsx: str,
+         out_all_json: str,
+         out_ml_json: str):
+    pairs = load_all_json(json_dir)
+    if not pairs:
+        print(f"No valid JSON found in {json_dir}.");
+        return
+
+    objs = [obj for _, obj in pairs]
+    elem_cols = gather_elements(objs)
+    print(f"Elements: {', '.join(elem_cols) if elem_cols else '(none)'}")
+
+    rec_rows: List[Dict[str, Any]] = []
+    ph_rows: List[Dict[str, Any]] = []
+
+    for idx, (fname, obj) in enumerate(pairs):
+        row, phs = flatten_record(obj, elem_cols, src_file=fname, rec_idx=idx)
+        rec_rows.append(row)
+        ph_rows.extend(phs)
+
+    rec_df = pd.DataFrame(rec_rows)
+    ph_df = pd.DataFrame(ph_rows)
+
+
+    preferred = [
+        "src", "idx", "name", "cond",
+        "dproc", "dtemp", "ddetail", "h1proc", "h1time", "h1temp", "h2proc", "h2time", "h2temp",
+        "cool", "cunit", "csrc", "alias", "remarks",
+        "dT", "dR", "T1", "t1", "T2", "t2",
+    ]
+    elem_order = [f"e{e}" for e in elem_cols]
+    mech_cols = [c for c in ["y", "uts", "uel", "tel"] if c in rec_df.columns]
+    pair_cols = []
+
+    phase_names = ["FCC", "BCC", "HCP", "B2", "L12", "L21", "gamma", "Ni3Ti"]
+    for ph in phase_names:
+        pair_cols += [f"P{ph}", f"S{ph}"]
+
+    exist = list(rec_df.columns)
+    ordered = [c for c in preferred if c in exist] + elem_order + mech_cols + [c for c in pair_cols if c in exist]
+    ordered += [c for c in exist if c not in ordered]
+    rec_df = rec_df.reindex(columns=ordered)
+
+
+    out_all_xlsx = Path(out_all_xlsx);
+    out_all_xlsx.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(out_all_xlsx, engine="xlsxwriter") as writer:
+        rec_df.to_excel(writer, index=False, sheet_name="records")
+        if ph_df.empty:
+            ph_df = pd.DataFrame(columns=[
+                "src", "idx", "pidx", "name", "std", "praw", "p", "szraw", "szum",
+                "a", "b", "c", "morph", "dist", "matrix", "note"
+            ])
+        ph_df.to_excel(writer, index=False, sheet_name="phases")
+    print(f"Saved: {out_all_xlsx.resolve()}")
+
+
+    ml_df = build_ml_df(rec_df)
+    out_ml_xlsx = Path(out_ml_xlsx);
+    out_ml_xlsx.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(out_ml_xlsx, engine="xlsxwriter") as writer:
+        ml_df.to_excel(writer, index=False, sheet_name="ml_records")
+    print(f"Saved: {out_ml_xlsx.resolve()}")
+
+
+    out_all_json = Path(out_all_json);
+    out_all_json.parent.mkdir(parents=True, exist_ok=True)
+    all_obj = {"records": df_to_json_records(rec_df), "phases": df_to_json_records(ph_df)}
+    out_all_json.write_text(json.dumps(all_obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"Saved: {out_all_json.resolve()}")
+
+    out_ml_json = Path(out_ml_json);
+    out_ml_json.parent.mkdir(parents=True, exist_ok=True)
+    ml_obj = {"ml_records": df_to_json_records(ml_df)}
+    out_ml_json.write_text(json.dumps(ml_obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"Saved: {out_ml_json.resolve()}")
+
+
+    print(f"\nProcessing totals:")
+    print(f"Records: {len(rec_df)}")
+    print(f"Phase records: {len(ph_df)}")
+    print(f"ML columns: {len(ml_df.columns)}")
+
+
+    ml_feature_cols = [c for c in ml_df.columns if
+                       c.startswith(('e', 'P', 'S')) or c in ['dT', 'dR', 'T1', 't1', 'T2', 't2']]
+    print(f"ML features: {len(ml_feature_cols)}")
+    if ml_feature_cols:
+        print(f"Features: {', '.join(ml_feature_cols[:10])}{'...' if len(ml_feature_cols) > 10 else ''}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Convert JSON records to Excel and JSON tables.")
+    parser.add_argument("--json_dir", default="./json_out", help="JSON input folder")
+    parser.add_argument("--out_all_xlsx", default="./all_information.xlsx",
+                        help="Records and phases Excel file")
+    parser.add_argument("--out_ml_xlsx", default="./ml_input.xlsx",
+                        help="ML Excel file")
+    parser.add_argument("--out_all_json", default="./all_information.json",
+                        help="Records and phases JSON file")
+    parser.add_argument("--out_ml_json", default="./ml_input.json",
+                        help="ML JSON file")
+    args = parser.parse_args()
+
+    main(args.json_dir, args.out_all_xlsx, args.out_ml_xlsx, args.out_all_json, args.out_ml_json)
