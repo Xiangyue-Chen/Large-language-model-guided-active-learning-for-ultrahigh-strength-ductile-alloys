@@ -1,0 +1,560 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import argparse
+import ast
+import importlib
+import json
+import re
+import time
+from pathlib import Path
+from typing import Any, Callable, Dict, Union
+
+
+PdfAnalyzer = Callable[[Path, str], str]
+
+
+PRIMARY_PROMPT = r"""
+Extract alloy composition, processing routes, microstructure, phases,
+and tensile properties from the supplied PDF. Return JSON in English.
+
+[Mechanical test and fabrication screening]
+Before extracting any information, perform both screening steps below.
+
+Screening 1: Mechanical test type
+1. Identify whether the mechanical properties were measured in a tensile
+   test or a compression test.
+2. Identification keywords:
+   - Tensile test: tensile test, tensile strength, tensile properties,
+     uniaxial tension, dog-bone specimen, gauge length.
+   - Compression test: compression test, compressive strength, compressive
+     properties, uniaxial compression, cylindrical specimen.
+3. If the paper uses compression tests, immediately return:
+   {"skip_reason": "compression_test",
+    "message": "Compression testing."}
+
+Screening 2: Fabrication method
+1. Check the exclusion criteria first. Search the title, abstract, and
+   keywords for the following terms:
+   - Additive manufacturing: SLM, selective laser melting, 3D printing,
+     additive manufacturing, LENS, EBM, electron beam melting, laser powder
+     bed fusion, LPBF, direct metal laser sintering, DMLS, laser melting
+     deposition, LMD.
+   - Powder metallurgy: powder metallurgy, hot pressing, spark plasma
+     sintering, SPS, hot isostatic pressing, HIP.
+   - Mechanical alloying: mechanical alloying, ball milling, MA.
+   - Thin-film preparation: sputtering, PVD, CVD, thin film,
+     magnetron sputtering.
+   - Other non-casting methods: rapid solidification, melt spinning,
+     zone melting.
+2. Strict decision rules:
+   - If any exclusion keyword appears in the title, abstract, or keywords,
+     stop immediately without reading the main text.
+   - If the fabrication procedure in the main text includes an excluded
+     method, stop processing immediately.
+   - Return:
+     {"skip_reason": "process_type",
+      "message": "Detected [specific fabrication method]; processing skipped.",
+      "detected_method": "the specific method detected"}
+     Use "additive_manufacturing" for additive manufacturing and
+     "non_casting_process" for other excluded fabrication methods,
+     as specified in the output rules below.
+3. Accepted fabrication methods only:
+   - Vacuum arc melting: vacuum arc melting, VAM, arc melting.
+   - Induction melting: vacuum induction melting, VIM, induction melting.
+   - Casting: casting, as-cast, ingot casting.
+   - The melting or casting process must be explicitly described.
+     Do not infer it solely from the expression "as-cast".
+4. Continue full extraction only when both criteria are satisfied:
+   tensile testing and an accepted melting/casting fabrication process.
+
+[Separate records]
+Extract alloy composition, processing route, microstructure/phase
+information, and mechanical properties.
+
+- If the same composition has multiple processing, heat-treatment, or
+  testing conditions (for example, as-cast, 650°C, and 750°C, or aging
+  for 1 h and 24 h), create a separate record for every condition.
+  Each record must correspond to one condition only, including one route
+  and its parameters. Never mix values from different conditions in the
+  same JSON object.
+- When several aging temperature/time combinations are reported for one
+  alloy, expand them individually. For example, solution treatment at
+  1200°C for 1 h followed by aging at 650°C for either 1 h or 24 h
+  requires two independent objects. Clearly identify each route in
+  "condition", for example:
+  "ST 1200°C/1 h -> CR 80% -> Aging 650°C/1 h"
+  and "ST 1200°C/1 h -> CR 80% -> Aging 650°C/24 h".
+- Explicitly reported as-cast, 650°C, and 750°C properties require three
+  independent objects. Specify the relevant temperatures and times in
+  "condition". Do not average or combine these properties.
+
+[Processing and properties]
+1. Every heat-treatment step must include its temperature, duration, and
+   cooling method. Cooling may be air cooling, water quenching, or
+   furnace cooling. If the paper does not report the cooling method,
+   default to water quenching.
+2. Typical heat-treatment steps are homogenization, recrystallization,
+   and aging, in that order. When rolling is used, it is usually performed
+   after the initial homogenization treatment. Distinguish cold rolling
+   (CR) from hot rolling (HR). Output the steps in chronological order.
+3. Determine whether the alloy underwent deformation or heat treatment.
+   If neither occurred, write "as-cast". Split separately reported
+   as-cast, 650°C, 750°C, and other conditions into individual records.
+4. Identify whether tensile testing was performed at room, elevated, or
+   cryogenic temperature. Default to room temperature when unspecified.
+   Continue only after confirming that the data are from tensile tests.
+5. If the paper provides a full alloy designation, such as Ti-6Al-4V
+   or Ti-0.5La, record the alloy name before listing element contents.
+   Examine every table.
+6. Extract yield strength (YS), tensile strength/ultimate tensile
+   strength (TS/UTS), and elongation from tensile-test data.
+   Strength is generally reported in MPa. Convert GPa to MPa:
+   1.5 GPa = 1500 MPa.
+7. Extract phase type, volume/area fraction (%), size/grain size with
+   units, lattice constants, morphology, distribution, matrix relationship,
+   and important notes such as phase aliases.
+   Convert size units when necessary: 1 mm = 1000 μm.
+   Use "a_nm" for cubic phases; non-cubic phases may also use "b_nm"
+   and "c_nm". Record relationships such as "in FCC",
+   "along grain boundaries", or "dispersed precipitates".
+   If phase fractions or sizes vary with aging temperature or duration,
+   attach them to the corresponding condition in separate records.
+8. The target papers concern high-entropy alloys (HEAs).
+   Never fabricate information. Prefer values from figures, tables,
+   and captions. Include source anchors such as "Fig.", "Table", or "p."
+   in "remarks".
+9. Preserve ranges and uncertainties as strings, for example
+   "680±15 MPa", "7–9%", or "5–8 nm". Cite their source anchors
+   in "remarks".
+10. When both matrix and precipitate fractions are reported, record them
+    separately. Identify the matrix in the precipitate's "matrix" field,
+    or explain the relationship in "note", for example "in FCC, 40%".
+11. One JSON object may contain only one alloy, one processing/
+    heat-treatment route, and one testing condition, together with the
+    corresponding composition, properties, and microstructure.
+    Return a JSON array when multiple records are needed.
+
+[Composition and aliases]
+1. If an alias or placeholder name such as Fe-Co-V or FeCoNi occurs
+   alongside an explicit stoichiometric formula such as FeCo0.8V0.2
+   or tabulated at%/wt% values, use the explicit formula or table.
+   Preserve the placeholder only in "alias".
+2. For (FeNi)50(CoCrMn)50, Fe and Ni equally share 50%, so each is
+   25%. Co, Cr, and Mn equally share the other 50%, approximately
+   16.67% each. Apply the rounding rule below so the total is 100%.
+3. For variable formulas such as AlxCoCrCuFeNi or Fe(Co,Ni)xCr:
+   - Search the entire paper, including tables, captions, axes, and
+     parenthetical text, for every reported value of x or other variables.
+   - Create an independent JSON object for each value. Split further if
+     processing or testing conditions differ.
+   - Never leave symbolic values such as "x" or "y" in "composition".
+   - Substitute explicitly reported values such as x = 0, 0.25, 0.5,
+     and normalize the atomic ratios to 100% (default at%).
+     For AlxCoCrCuFeNi, Al has coefficient x and each other element
+     has coefficient 1. Therefore:
+     Al at% = 100*x/(x+5);
+     Co, Cr, Cu, Fe, and Ni at% = 100/(x+5) each.
+   - If only a variable range is given without discrete values, note
+     "Only a range is reported; no discrete values are available for
+     expansion" in "remarks" and skip that series. Do not output a
+     composition containing unresolved variables.
+4. Use an equal split for names without numerical coefficients only
+   when neither numerical tables nor coefficient-bearing formulas exist.
+   Round to two decimal places and use the final element to correct
+   the total to 100%.
+5. Normalize concatenated formulas with coefficients to 100% using
+   atomic ratios by default, unless wt% is explicitly stated.
+6. Add composition provenance:
+   - Formula-derived: "_source": "formula: FeCo0.8V0.2".
+   - Equal-split inference:
+     "_source": "equal-split from alias: Fe-Co-V".
+     In "remarks", explain that an equal split was used because
+     numerical composition data were unavailable.
+7. Preserve "alias", for example "alias": ["Fe-Co-V"].
+   Do not let aliases replace the actual composition.
+
+[Output]
+- Compression test: return {"skip_reason": "compression_test"}.
+- Additive manufacturing:
+  return {"skip_reason": "additive_manufacturing"}.
+- Other non-casting fabrication:
+  return {"skip_reason": "non_casting_process"}.
+- Accepted tensile testing and melting/casting:
+  - One alloy and one condition: return one JSON object.
+  - Multiple alloys or conditions: return a JSON array.
+- Output JSON only. Do not add explanatory text outside the JSON.
+  If extraction is impossible, still return valid JSON; fields may
+  be empty, but the structure must be valid.
+
+[Composition conversion]
+Use explicit composition tables or numerical statements from the paper
+whenever available. Otherwise use the following inference rules and
+document "equal split from name" or "stoichiometric conversion" in "remarks".
+
+1. Explicit percentages:
+   - Numbers in names such as Fe30Co30Ni30Al5Ti5 are element percentages.
+     Default to at% unless wt% is explicitly specified.
+   - Example:
+     {"Fe": 30, "Co": 30, "Ni": 30, "Al": 5, "Ti": 5, "_unit": "at%"}.
+2. Equal split without numbers:
+   - Fe-Co-Ni or FeCoNi with no coefficients is equally divided.
+     Use two decimal places and correct the final value to total 100%.
+3. Stoichiometric coefficients:
+   - FeCoNi2 has an atomic ratio of 1:1:2:
+     Fe 25%, Co 25%, Ni 50%.
+4. Separators and notation:
+   - Support concatenation, hyphens (-/–/—), middle dots (·), and
+     slashes (/), with case-insensitive recognition.
+   - Follow the paper's at%/wt% designation. Default to at% if absent.
+5. Rounding and validation:
+   - Retain two decimal places.
+   - Document any inference or equal split with its method and source
+     anchor (Fig./Table/p.) in "remarks".
+
+[Microstructure and phases]
+- Identify phases/families including, but not limited to:
+  FCC, BCC, HCP;
+  ordered phases/intermetallics L12 (γ′, Ni3Al type),
+  B2 (ordered BCC), L21 (Heusler), DO22, DO24, L10, κ;
+  Laves (C14/C15/C36);
+  σ (sigma), μ, χ, η (Ni3Ti), δ;
+  carbides, nitrides, and borides such as MC, M23C6, M7C3,
+  M6C, MN, and MB.
+- Normalize equivalent names, for example:
+  γ′ = L12 = ordered FCC; B2 = ordered BCC; Heusler = L21.
+- Represent each reported phase with a separate object. Suggested fields:
+  {
+    "name": "phase name",
+    "vol": "volume fraction in %, or a range string",
+    "size": "grain size or thickness, including units",
+    "a_nm": "a for a cubic phase",
+    "b_nm": "",
+    "c_nm": "",
+    "morphology": "granular/plate-like/needle-like/lamellar/network, etc.",
+    "distribution": "intragranular/grain boundary/subgrain boundary/along dislocations/layered",
+    "matrix": "host matrix, for example FCC",
+    "note": "additional information and source anchors"
+  }
+- For hierarchical fractions such as "L12 occupies 40% within FCC",
+  record the parent and child phases separately. Add "matrix": "FCC"
+  to the child phase or explain the relationship in "note".
+- If only an area fraction or mass fraction is reported, retain it in
+  "vol" and identify the fraction type in "note".
+- For cubic phases, use only "a_nm". For non-cubic phases such as
+  HCP, tetragonal, or orthorhombic phases, also provide "b_nm" and
+  "c_nm" when reported. If the lattice type is unclear, leave the
+  corresponding fields empty and write "Lattice type not specified"
+  in "note".
+
+[Examples]
+Skipped papers:
+{"skip_reason": "compression_test",
+ "message": "Compression testing."}
+{"skip_reason": "additive_manufacturing",
+ "message": "SLM/3D printing."}
+{"skip_reason": "non_casting_process",
+ "message": "Powder metallurgy."}
+
+Accepted papers (tensile testing and melting/casting):
+- Fe30Co30Ni30Al5Ti5: Fe 30, Co 30, Ni 30, Al 5, Ti 5 (at%).
+- Fe-Co-Ni / FeCoNi: Fe 33.33, Co 33.33, Ni 33.34 (at%).
+- FeCoNi2: Fe 25.00, Co 25.00, Ni 50.00 (at%).
+
+Example JSON output for tensile testing:
+[
+  {
+    "alloy_name": "Fe22.5Co22.5Ni22.5Cr22.5Al10 - example",
+    "composition": {
+      "Fe": 22.5,
+      "Co": 22.5,
+      "Ni": 22.5,
+      "Cr": 22.5,
+      "Al": 10.0,
+      "_unit": "at%"
+    },
+    "Heat Treatment Process1": "homogenization",
+    "Heat Treatment Temperature1": "1100°C",
+    "Heat Treatment Time1": "2 h",
+    "Cooling1": "water quench",
+    "Deformation Process": "rolling",
+    "Deformation Temperature": "950°C",
+    "Deformation Detail": "cold rolling 40%",
+    "Heat Treatment Process2": "recrystallization",
+    "Heat Treatment Temperature2": "900°C",
+    "Heat Treatment Time2": "1 h",
+    "Cooling2": "furnace cooling",
+    "Heat Treatment Process3": "aging",
+    "Heat Treatment Temperature3": "450°C",
+    "Heat Treatment Time3": "8 h",
+    "Cooling3": "air cooling",
+    "condition": "1100°C/2 h -> WQ -> rolling(40%) -> 900°C/1 h -> FC -> 450°C/8 h -> AC",
+    "mechanical": {
+      "yield": 820,
+      "yield_unit": "MPa",
+      "uts": 1280,
+      "uts_unit": "MPa",
+      "uniform_elongation": 9.6,
+      "uniform_elongation_unit": "%",
+      "total_elongation": 18.4,
+      "total_elongation_unit": "%"
+    },
+    "phases": [
+      {
+        "name": "FCC",
+        "vol": "62%",
+        "size": "12.4 μm",
+        "a_nm": "0.357",
+        "note": "A small amount of L12 precipitates within grains and at interfaces."
+      },
+      {
+        "name": "BCC",
+        "vol": "25%",
+        "size": "6.8 μm",
+        "a_nm": "0.289",
+        "note": "Forms in Al-enriched regions."
+      },
+      {
+        "name": "L12",
+        "vol": "13%",
+        "size": "6.2 nm",
+        "a_nm": "0.364",
+        "note": "Spherical morphology and dispersed distribution."
+      }
+    ],
+    "remarks": "Example values."
+  }
+]
+"""
+
+COMBINED_PROMPT = PRIMARY_PROMPT + (
+    "\n\nReturn JSON only (an object or an array), with no other text. "
+    "JSON must strictly follow standard syntax. Use double quotes for "
+    "property names. Strings containing %, nm, or °C must be quoted."
+)
+
+
+DEBUG_DIR = "./debug_out"
+JSON_OUT = "./json_out"
+SLEEP_EACH = 0.4
+
+
+def fix_json(text: str) -> str:
+    text = text.strip()
+    text = re.sub(r"^\x60{3}(?:json)?\s*|\s*\x60{3}$", "", text).strip()
+    try:
+        json.loads(text)
+        return text
+    except json.JSONDecodeError:
+        pass
+
+    try:
+        literal = ast.literal_eval(text)
+        if isinstance(literal, (dict, list)):
+            return json.dumps(literal, ensure_ascii=False, allow_nan=False)
+    except (ValueError, SyntaxError, TypeError):
+        pass
+
+    quoted = r'"(?:\\.|[^"\\])*"'
+    text = re.sub(
+        quoted + r"|,\s*(?=[}\]])",
+        lambda match: match.group(0) if match.group(0).startswith('"') else "",
+        text,
+    )
+    text = re.sub(
+        quoted + r"|(?<=[{,])\s*([A-Za-z_]\w*)\s*:",
+        lambda match: (
+            match.group(0) if match.group(1) is None
+            else f'"{match.group(1)}":'
+        ),
+        text,
+    )
+    text = re.sub(
+        quoted + r"|(:\s*)(-?\d+(?:\.\d+)?)\s*(MPa|GPa|°C|μm|nm|%|h)(?=\s*[,}\]])",
+        lambda match: (
+            match.group(0) if match.group(1) is None
+            else f'{match.group(1)}"{match.group(2)} {match.group(3)}"'
+        ),
+        text,
+    )
+
+    decoder = json.JSONDecoder()
+    objects = []
+    remaining = text
+    try:
+        while remaining.strip():
+            item, end = decoder.raw_decode(remaining.lstrip())
+            objects.append(item)
+            remaining = remaining.lstrip()[end:]
+    except json.JSONDecodeError:
+        return text
+    if len(objects) > 1 and all(isinstance(item, dict) for item in objects):
+        return json.dumps(objects, ensure_ascii=False, allow_nan=False)
+    return text
+
+
+def extract_and_to_json(
+    pdf_path: Union[str, Path],
+    base_name: str,
+    analyze_pdf: PdfAnalyzer,
+    debug_dir: Union[str, Path] = DEBUG_DIR,
+) -> Any:
+    if not callable(analyze_pdf):
+        raise TypeError("PDF analyzer is not callable.")
+
+    raw_json_text = analyze_pdf(Path(pdf_path), COMBINED_PROMPT)
+    if not isinstance(raw_json_text, str):
+        raise TypeError("PDF analyzer must return a JSON string.")
+
+    debug_path = Path(debug_dir)
+    debug_path.mkdir(parents=True, exist_ok=True)
+    (debug_path / f"{base_name}__raw_json.txt").write_text(
+        raw_json_text, encoding="utf-8"
+    )
+    if not raw_json_text.strip():
+        raise ValueError("Empty analyzer response.")
+
+    cleaned = re.sub(
+        r"^\x60{3}(?:json)?\s*|\s*\x60{3}$",
+        "",
+        raw_json_text.strip(),
+    ).strip()
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        print("Invalid JSON; attempting formatting repair.")
+        fixed = fix_json(cleaned)
+        (debug_path / f"{base_name}__fixed_json.txt").write_text(
+            fixed, encoding="utf-8"
+        )
+        try:
+            data = json.loads(fixed)
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                f"Invalid JSON; raw response: "
+                f"{debug_path / (base_name + '__raw_json.txt')}."
+            ) from error
+
+    if not isinstance(data, (dict, list)):
+        raise ValueError("The response must be a JSON object or array.")
+    if isinstance(data, list) and not all(isinstance(item, dict) for item in data):
+        raise ValueError("Every item in a record array must be a JSON object.")
+    return data
+
+
+def process_pdf(
+    pdf_path: Union[str, Path],
+    out_json_dir: Union[str, Path],
+    analyze_pdf: PdfAnalyzer,
+    debug_dir: Union[str, Path] = DEBUG_DIR,
+) -> Any:
+    pdf_path = Path(pdf_path)
+    pdf_size = pdf_path.stat().st_size
+    print(f"Processing {pdf_path.name}: PDF size {pdf_size / 1024 / 1024:.2f} MB")
+
+    data = extract_and_to_json(
+        pdf_path, pdf_path.stem, analyze_pdf, debug_dir=debug_dir
+    )
+    out_json_dir = Path(out_json_dir)
+    out_json_dir.mkdir(parents=True, exist_ok=True)
+    if isinstance(data, list):
+        for index, item in enumerate(data, 1):
+            out_path = out_json_dir / f"{pdf_path.stem}_{index}.json"
+            out_path.write_text(
+                json.dumps(item, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+    else:
+        out_path = out_json_dir / f"{pdf_path.stem}.json"
+        out_path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    return data
+
+
+def process_folder(
+    input_dir: Union[str, Path],
+    json_out_dir: Union[str, Path],
+    analyze_pdf: PdfAnalyzer,
+    debug_dir: Union[str, Path] = DEBUG_DIR,
+    sleep_each: float = SLEEP_EACH,
+) -> Dict[str, int]:
+    input_path = Path(input_dir)
+    if not input_path.is_dir():
+        raise NotADirectoryError(f"Input folder does not exist: {input_path}")
+    if not callable(analyze_pdf):
+        raise TypeError("PDF analyzer is not callable.")
+
+    pdfs = sorted(
+        path for path in input_path.iterdir()
+        if path.is_file() and path.suffix.lower() == ".pdf"
+    )
+    summary = {"processed": 0, "failed": 0}
+    if not pdfs:
+        print(f"No PDF files found in {input_path}")
+        return summary
+
+    for index, pdf_path in enumerate(pdfs, 1):
+        print(f"[{index}/{len(pdfs)}]")
+        try:
+            process_pdf(pdf_path, json_out_dir, analyze_pdf, debug_dir=debug_dir)
+            summary["processed"] += 1
+        except Exception as error:
+            print(f"Failed to process {pdf_path.name}: {error}")
+            summary["failed"] += 1
+        time.sleep(sleep_each)
+
+    print(f"JSON output directory: {Path(json_out_dir).absolute()}")
+    print(f"Debug output directory: {Path(debug_dir).absolute()}")
+    print(f"Processed: {summary['processed']}; failed: {summary['failed']}")
+    return summary
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="HEA literature extraction."
+    )
+    parser.add_argument("input_dir", nargs="?", help="Folder containing PDF files.")
+    parser.add_argument(
+        "--adapter",
+        help="PDF analyzer: module:function (pdf_path, prompt).",
+    )
+    parser.add_argument("--json-out", default=JSON_OUT, help="JSON output folder.")
+    parser.add_argument("--debug-dir", default=DEBUG_DIR, help="Raw response folder.")
+    parser.add_argument(
+        "--export-prompt", metavar="FILE", help="Export the English prompt only."
+    )
+    args = parser.parse_args()
+
+    if args.export_prompt:
+        destination = Path(args.export_prompt)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(COMBINED_PROMPT.strip() + "\n", encoding="utf-8")
+        print(f"English extraction prompt saved to: {destination.absolute()}")
+        return 0
+
+    if not args.input_dir:
+        parser.error("Specify an input folder or use --export-prompt.")
+    if not args.adapter:
+        parser.error(
+            "No analyzer is configured. Supply --adapter module:function, "
+            "or import process_folder and pass an analyzer callable."
+        )
+
+    module_name, separator, function_name = args.adapter.partition(":")
+    if not separator or not module_name or not function_name:
+        parser.error("--adapter must use the form module:function.")
+    try:
+        module = importlib.import_module(module_name)
+        analyze_pdf = getattr(module, function_name)
+        if not callable(analyze_pdf):
+            parser.error("The selected adapter is not callable.")
+        summary = process_folder(
+            args.input_dir, args.json_out, analyze_pdf, debug_dir=args.debug_dir
+        )
+    except (ImportError, AttributeError, OSError, TypeError) as error:
+        parser.error(str(error))
+    return 1 if summary["failed"] else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
