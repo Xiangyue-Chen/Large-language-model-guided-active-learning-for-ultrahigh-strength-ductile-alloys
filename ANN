@@ -1,0 +1,959 @@
+import copy
+import json
+import math
+import os
+import pickle
+import random
+import time
+import warnings
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import torch
+from bayes_opt import BayesianOptimization
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import KFold
+from sklearn.preprocessing import StandardScaler
+from torch import nn
+
+warnings.filterwarnings("ignore")
+
+FILE = Path(
+    os.getenv(
+        "DATA_FILE",
+        "C:\\Users\\Administrator\\Desktop\\\u9879\u76ee\\\u6570\u636e\u5e93\\HEA_data.xlsx",
+    )
+)
+INPUT_SLICE = slice(1, 30)
+TARGET_COL = 30
+TARGET_NAME = "yield"
+MODEL_NAME = "ANN"
+RESULT_PREFIX = "ann"
+
+FINAL_CV_SEEDS = list(range(40, 50))
+FINAL_N_SPLITS = 5
+BO_SELECTION_SEED = int(os.getenv("BO_SELECTION_SEED", "42"))
+BO_SELECTION_N_SPLITS = int(os.getenv("BO_SELECTION_N_SPLITS", "5"))
+INIT_POINTS = int(os.getenv("BO_INIT_POINTS", "10"))
+NUM_ITER = int(os.getenv("BO_NUM_ITER", "50"))
+BO_RANDOM_STATE = int(os.getenv("BO_RANDOM_STATE", "40"))
+BO_EPOCHS = int(os.getenv("ANN_BO_EPOCHS", "500"))
+FINAL_EPOCHS = int(os.getenv("ANN_FINAL_EPOCHS", "1000"))
+BATCH_CANDIDATES = (64, 128, 256, 512, 1024)
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+OUTPUT_DIR = Path(os.getenv("GLOBAL_OUTPUT_DIR", str(SCRIPT_DIR))).resolve()
+BO_RESULTS_PATH = OUTPUT_DIR / f"ann_{TARGET_NAME}_bo_results.xlsx"
+STATISTICS_PATH = OUTPUT_DIR / f"ann_{TARGET_NAME}_model_statistics.xlsx"
+BEST_MODEL_SCATTER_PATH = OUTPUT_DIR / f"ann_{TARGET_NAME}_50fold_scatter.png"
+BEST_MODEL_PREDICTIONS_PATH = OUTPUT_DIR / f"ann_{TARGET_NAME}_50fold_predictions.xlsx"
+SCALER_PATH = OUTPUT_DIR / f"ann_{TARGET_NAME}_global_scaler.pkl"
+MODEL_SAVE_DIR = OUTPUT_DIR / f"all_ann_{TARGET_NAME}_models"
+SEED42_BEST_FOLD_PATH = OUTPUT_DIR / f"{TARGET_NAME}_seed42_best_fold.png"
+SEED_BEST_PLOT_DIR = OUTPUT_DIR / f"{TARGET_NAME}_seed_best_fold_plots"
+
+PBOUNDS = {
+    "hidden_width": (64, 384),
+    "depth": (1, 5),
+    "dropout": (0.0, 0.30),
+    "log10_learning_rate": (-4, -2),
+    "log10_weight_decay": (-7, -2),
+    "batch_index": (0, len(BATCH_CANDIDATES) - 1),
+}
+
+
+def active_final_seeds():
+    value = os.getenv("BO_SEEDS", "").strip()
+    if not value:
+        return FINAL_CV_SEEDS
+    seeds = [int(item.strip()) for item in value.split(",") if item.strip()]
+    if not seeds:
+        raise ValueError("BO_SEEDS did not contain any integer seed.")
+    return seeds
+
+
+def active_final_n_splits():
+    return int(os.getenv("BO_N_SPLITS", str(FINAL_N_SPLITS)))
+
+
+def resolve_device():
+    requested = os.getenv("ANN_DEVICE", "").strip()
+    if requested:
+        device = torch.device(requested)
+        if device.type == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError(f"ANN_DEVICE={requested} requested unavailable CUDA.")
+        return device
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def metric_values(y_true, y_pred):
+    mse = mean_squared_error(y_true, y_pred)
+    return {
+        "r2": float(r2_score(y_true, y_pred)),
+        "mae": float(mean_absolute_error(y_true, y_pred)),
+        "mse": float(mse),
+        "rmse": float(math.sqrt(mse)),
+    }
+
+
+def convert_parameters(raw):
+    batch_index = min(
+        len(BATCH_CANDIDATES) - 1,
+        max(0, int(round(raw["batch_index"]))),
+    )
+    return {
+        "hidden_width": min(384, max(64, int(round(raw["hidden_width"])))),
+        "depth": min(5, max(1, int(round(raw["depth"])))),
+        "dropout": min(0.30, max(0.0, float(raw["dropout"]))),
+        "learning_rate": float(10.0 ** raw["log10_learning_rate"]),
+        "weight_decay": float(10.0 ** raw["log10_weight_decay"]),
+        "batch_size": int(BATCH_CANDIDATES[batch_index]),
+    }
+
+
+class MLP(nn.Module):
+    def __init__(self, input_dim, hidden_width, depth, dropout):
+        super().__init__()
+        layers = []
+        current_width = input_dim
+        for _ in range(depth):
+            linear = nn.Linear(current_width, hidden_width)
+            nn.init.kaiming_normal_(linear.weight, nonlinearity="relu")
+            nn.init.zeros_(linear.bias)
+            layers.extend(
+                [
+                    linear,
+                    nn.BatchNorm1d(hidden_width),
+                    nn.ReLU(),
+                    nn.Dropout(dropout),
+                ]
+            )
+            current_width = hidden_width
+        output = nn.Linear(current_width, 1)
+        nn.init.kaiming_normal_(output.weight, nonlinearity="linear")
+        nn.init.zeros_(output.bias)
+        layers.append(output)
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, inputs):
+        return self.network(inputs)
+
+
+def load_data():
+    frame = pd.read_excel(FILE)
+    required_column = max(INPUT_SLICE.stop - 1, TARGET_COL)
+    if frame.shape[1] <= required_column:
+        raise ValueError(
+            f"The dataset has {frame.shape[1]} columns; column index "
+            f"{required_column} is required."
+        )
+
+    numeric_target = pd.to_numeric(frame.iloc[:, TARGET_COL], errors="coerce")
+    valid_target = numeric_target.notna()
+    frame = frame.loc[valid_target].copy()
+    y = numeric_target.loc[valid_target].to_numpy(dtype=np.float32)
+    excel_rows = frame.index.to_numpy(dtype=int) + 2
+    X_frame = frame.iloc[:, INPUT_SLICE].apply(pd.to_numeric, errors="coerce")
+    X_raw = X_frame.fillna(0.0).to_numpy(dtype=float)
+
+    if len(y) < 2:
+        raise ValueError("At least two valid target rows are required.")
+    if not np.isfinite(X_raw).all() or not np.isfinite(y).all():
+        raise ValueError("The numeric input or target contains non-finite values.")
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_raw).astype(np.float32)
+    with SCALER_PATH.open("wb") as handle:
+        pickle.dump(scaler, handle)
+    return X_scaled, y, excel_rows, scaler
+
+
+def make_cv_splits(X_scaled, seeds, n_splits):
+    if n_splits < 2 or n_splits > len(X_scaled):
+        raise ValueError(
+            f"n_splits must be between 2 and {len(X_scaled)}, got {n_splits}."
+        )
+    split_records = []
+    for seed in seeds:
+        splitter = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
+        for fold, (train_idx, test_idx) in enumerate(
+            splitter.split(X_scaled), start=1
+        ):
+            split_records.append(
+                {
+                    "seed": int(seed),
+                    "fold": int(fold),
+                    "train_idx": train_idx,
+                    "test_idx": test_idx,
+                }
+            )
+    return split_records
+
+
+def make_epoch_batches(sample_count, batch_size, generator):
+    if sample_count < 2:
+        raise ValueError("BatchNorm requires at least two training samples.")
+    order = torch.randperm(sample_count, generator=generator)
+    chunks = list(order.split(min(batch_size, sample_count)))
+    if len(chunks) > 1 and len(chunks[-1]) == 1:
+        chunks[-2] = torch.cat([chunks[-2], chunks[-1]])
+        chunks.pop()
+    return chunks
+
+
+def train_fold_network(
+    X_train,
+    y_train,
+    X_test,
+    y_test,
+    params,
+    epochs,
+    training_seed,
+    device,
+    capture_state,
+):
+    set_seed(training_seed)
+    model = MLP(
+        input_dim=X_train.shape[1],
+        hidden_width=params["hidden_width"],
+        depth=params["depth"],
+        dropout=params["dropout"],
+    ).to(device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=params["learning_rate"],
+        weight_decay=params["weight_decay"],
+    )
+    loss_function = nn.MSELoss()
+    X_train_tensor = torch.as_tensor(X_train, dtype=torch.float32, device=device)
+    y_train_tensor = torch.as_tensor(
+        y_train.reshape(-1, 1), dtype=torch.float32, device=device
+    )
+    X_test_tensor = torch.as_tensor(X_test, dtype=torch.float32, device=device)
+    batch_generator = torch.Generator(device="cpu")
+    batch_generator.manual_seed(training_seed)
+
+    best_test_r2 = -np.inf
+    best_epoch = 0
+    best_train_metrics = None
+    best_test_metrics = None
+    best_train_prediction = None
+    best_test_prediction = None
+    best_state = None
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        batches = make_epoch_batches(
+            len(X_train), params["batch_size"], batch_generator
+        )
+        for batch_indices_cpu in batches:
+            batch_indices = batch_indices_cpu.to(device)
+            optimizer.zero_grad(set_to_none=True)
+            prediction = model(X_train_tensor[batch_indices])
+            loss = loss_function(prediction, y_train_tensor[batch_indices])
+            if not torch.isfinite(loss):
+                raise FloatingPointError(
+                    f"Non-finite training loss at epoch {epoch}."
+                )
+            loss.backward()
+            optimizer.step()
+
+        model.eval()
+        with torch.no_grad():
+            train_prediction = (
+                model(X_train_tensor).squeeze(1).detach().cpu().numpy()
+            )
+            test_prediction = (
+                model(X_test_tensor).squeeze(1).detach().cpu().numpy()
+            )
+        train_metrics = metric_values(y_train, train_prediction)
+        test_metrics = metric_values(y_test, test_prediction)
+        if test_metrics["r2"] > best_test_r2:
+            best_test_r2 = test_metrics["r2"]
+            best_epoch = epoch
+            best_train_metrics = train_metrics
+            best_test_metrics = test_metrics
+            best_train_prediction = train_prediction.copy()
+            best_test_prediction = test_prediction.copy()
+            if capture_state:
+                best_state = {
+                    name: tensor.detach().cpu().clone()
+                    for name, tensor in model.state_dict().items()
+                }
+
+    if best_epoch == 0:
+        raise RuntimeError("No finite best test epoch was recorded.")
+    if capture_state and best_state is None:
+        raise RuntimeError("The requested best-epoch state was not captured.")
+
+    del model
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return {
+        "best_epoch": best_epoch,
+        "train_metrics": best_train_metrics,
+        "test_metrics": best_test_metrics,
+        "train_prediction": best_train_prediction,
+        "test_prediction": best_test_prediction,
+        "state_dict": best_state,
+    }
+
+
+def run_global_bayesian_optimization(X_scaled, y, split_records, device):
+    trial_records = []
+    fold_detail_records = []
+    trial_number = 0
+    total_trials = INIT_POINTS + NUM_ITER
+
+    def objective(**raw_parameters):
+        nonlocal trial_number
+        trial_number += 1
+        started = time.perf_counter()
+        params = convert_parameters(raw_parameters)
+        parameters_json = json.dumps(
+            params, ensure_ascii=False, sort_keys=True
+        )
+        raw_parameters_json = json.dumps(
+            raw_parameters, ensure_ascii=False, sort_keys=True
+        )
+        fold_r2 = []
+        fold_rmse = []
+        errors = []
+
+        for split in split_records:
+            seed = split["seed"]
+            fold = split["fold"]
+            train_idx = split["train_idx"]
+            test_idx = split["test_idx"]
+            training_seed = seed * 100 + fold
+            detail = {
+                "trial": trial_number,
+                "seed": seed,
+                "fold": fold,
+                "train_samples": len(train_idx),
+                "test_samples": len(test_idx),
+                "parameters_json": parameters_json,
+            }
+            try:
+                result = train_fold_network(
+                    X_scaled[train_idx],
+                    y[train_idx],
+                    X_scaled[test_idx],
+                    y[test_idx],
+                    params,
+                    BO_EPOCHS,
+                    training_seed,
+                    device,
+                    capture_state=False,
+                )
+                train_metrics = result["train_metrics"]
+                test_metrics = result["test_metrics"]
+                detail.update(
+                    {f"train_{key}": value for key, value in train_metrics.items()}
+                )
+                detail.update(
+                    {f"test_{key}": value for key, value in test_metrics.items()}
+                )
+                detail["best_epoch"] = result["best_epoch"]
+                detail["error"] = ""
+                fold_r2.append(test_metrics["r2"])
+                fold_rmse.append(test_metrics["rmse"])
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                detail.update(
+                    {
+                        "train_r2": np.nan,
+                        "train_mae": np.nan,
+                        "train_mse": np.nan,
+                        "train_rmse": np.nan,
+                        "test_r2": np.nan,
+                        "test_mae": np.nan,
+                        "test_mse": np.nan,
+                        "test_rmse": np.nan,
+                        "best_epoch": np.nan,
+                        "error": error,
+                    }
+                )
+                errors.append(f"seed={seed}, fold={fold}: {error}")
+            fold_detail_records.append(detail)
+
+        elapsed = time.perf_counter() - started
+        if errors or len(fold_r2) != len(split_records):
+            mean_test_r2 = -1.0e12
+            mean_test_rmse = np.nan
+            error_text = " | ".join(errors[:3])
+        else:
+            mean_test_r2 = float(np.mean(fold_r2))
+            mean_test_rmse = float(np.mean(fold_rmse))
+            error_text = ""
+        trial_records.append(
+            {
+                "trial": trial_number,
+                "mean_test_r2": mean_test_r2,
+                "mean_test_rmse": mean_test_rmse,
+                "fold_count": len(fold_r2),
+                "elapsed_seconds": elapsed,
+                "parameters_json": parameters_json,
+                "raw_parameters_json": raw_parameters_json,
+                "error": error_text,
+            }
+        )
+        rmse_text = (
+            f"{mean_test_rmse:.6f}" if np.isfinite(mean_test_rmse) else "nan"
+        )
+        print(
+            f"[Global BO {trial_number}/{total_trials}] "
+            f"mean_test_r2={mean_test_r2:.6f}, "
+            f"mean_test_rmse={rmse_text}, elapsed={elapsed:.2f}s, "
+            f"params={parameters_json}",
+            flush=True,
+        )
+        return mean_test_r2
+
+    optimizer = BayesianOptimization(
+        f=objective,
+        pbounds=PBOUNDS,
+        random_state=BO_RANDOM_STATE,
+        verbose=0,
+        allow_duplicate_points=True,
+    )
+    optimizer.maximize(init_points=INIT_POINTS, n_iter=NUM_ITER)
+    successful = [record for record in trial_records if not record["error"]]
+    if not successful:
+        errors = "; ".join(record["error"] for record in trial_records[:3])
+        raise RuntimeError(f"All global BO candidates failed: {errors}")
+    best_trial = max(successful, key=lambda record: record["mean_test_r2"])
+    best_params = json.loads(best_trial["parameters_json"])
+    return (
+        best_params,
+        best_trial,
+        pd.DataFrame(trial_records),
+        pd.DataFrame(fold_detail_records),
+    )
+
+
+def fit_final_folds(
+    X_scaled,
+    y,
+    excel_rows,
+    scaler,
+    split_records,
+    best_params,
+    device,
+):
+    parameters_json = json.dumps(
+        best_params, ensure_ascii=False, sort_keys=True
+    )
+    fold_records = []
+    prediction_frames = []
+    fold_artifacts = {}
+    total = len(split_records)
+
+    for number, split in enumerate(split_records, start=1):
+        seed = split["seed"]
+        fold = split["fold"]
+        train_idx = split["train_idx"]
+        test_idx = split["test_idx"]
+        training_seed = seed * 100 + fold
+        started = time.perf_counter()
+        result = train_fold_network(
+            X_scaled[train_idx],
+            y[train_idx],
+            X_scaled[test_idx],
+            y[test_idx],
+            best_params,
+            FINAL_EPOCHS,
+            training_seed,
+            device,
+            capture_state=True,
+        )
+        elapsed = time.perf_counter() - started
+        model_path = MODEL_SAVE_DIR / f"seed_{seed}_fold_{fold}.pt"
+        torch.save(
+            {
+                "state_dict": result["state_dict"],
+                "input_dim": int(X_scaled.shape[1]),
+                "parameters": best_params,
+                "parameters_json": parameters_json,
+                "seed": seed,
+                "fold": fold,
+                "best_epoch": result["best_epoch"],
+                "target_name": TARGET_NAME,
+                "train_indices": train_idx,
+                "test_indices": test_idx,
+                "train_metrics": result["train_metrics"],
+                "test_metrics": result["test_metrics"],
+                "one_global_parameter_set": True,
+                "test_folds_used_for_global_bo": (
+                    seed == BO_SELECTION_SEED
+                ),
+                "bo_uses_seed42_folds_only": BO_SELECTION_SEED == 42,
+                "seed42_test_folds_used_for_global_bo": True,
+                "all_final_test_folds_used_for_global_bo": False,
+                "test_fold_used_for_epoch_selection": True,
+                "preprocessing_fit_scope": "full_target_dataset_before_cv",
+                "target_scaled": False,
+            },
+            model_path,
+        )
+        record = {
+            "seed": seed,
+            "fold": fold,
+            "train_samples": len(train_idx),
+            "test_samples": len(test_idx),
+            "best_epoch": result["best_epoch"],
+            "parameters_json": parameters_json,
+            "model_path": str(model_path),
+            "elapsed_seconds": elapsed,
+        }
+        record.update(
+            {
+                f"train_{key}": value
+                for key, value in result["train_metrics"].items()
+            }
+        )
+        record.update(
+            {
+                f"test_{key}": value
+                for key, value in result["test_metrics"].items()
+            }
+        )
+        fold_records.append(record)
+        prediction_frame = pd.DataFrame(
+            {
+                "seed": seed,
+                "fold": fold,
+                "best_epoch": result["best_epoch"],
+                "original_excel_row": excel_rows[test_idx],
+                "true_value": y[test_idx],
+                "predicted_value": result["test_prediction"],
+                "parameters_json": parameters_json,
+            }
+        )
+        prediction_frame["residual"] = (
+            prediction_frame["predicted_value"]
+            - prediction_frame["true_value"]
+        )
+        prediction_frame["abs_error"] = prediction_frame["residual"].abs()
+        prediction_frames.append(prediction_frame)
+        fold_artifacts[(seed, fold)] = {
+            "train_idx": train_idx,
+            "test_idx": test_idx,
+            "train_prediction": result["train_prediction"],
+            "test_prediction": result["test_prediction"],
+            "best_epoch": result["best_epoch"],
+        }
+        print(
+            f"[Final fold {number}/{total}] seed={seed}, fold={fold}, "
+            f"best_epoch={result['best_epoch']}, "
+            f"test_r2={result['test_metrics']['r2']:.6f}, "
+            f"test_rmse={result['test_metrics']['rmse']:.6f}",
+            flush=True,
+        )
+
+    return (
+        pd.DataFrame(fold_records).sort_values(["seed", "fold"]),
+        pd.concat(prediction_frames, ignore_index=True),
+        fold_artifacts,
+    )
+
+
+def summarize_final_folds(final_folds):
+    return pd.DataFrame(
+        [
+            {
+                "target": TARGET_NAME,
+                "model": MODEL_NAME,
+                "seed_count": final_folds["seed"].nunique(),
+                "fold_count": len(final_folds),
+                "mean_r2_50": final_folds["test_r2"].mean(),
+                "std_r2_50": final_folds["test_r2"].std(ddof=1),
+                "mean_mae_50": final_folds["test_mae"].mean(),
+                "std_mae_50": final_folds["test_mae"].std(ddof=1),
+                "mean_rmse_50": final_folds["test_rmse"].mean(),
+                "std_rmse_50": final_folds["test_rmse"].std(ddof=1),
+                "mean_best_epoch": final_folds["best_epoch"].mean(),
+                "one_global_parameter_set": True,
+                "test_folds_used_for_global_bo": True,
+                "bo_uses_seed42_folds_only": BO_SELECTION_SEED == 42,
+                "seed42_test_folds_used_for_global_bo": True,
+                "all_final_test_folds_used_for_global_bo": False,
+                "test_fold_used_for_epoch_selection": True,
+            }
+        ]
+    )
+
+
+def build_sample_prediction_summary(predictions):
+    grouped = predictions.groupby("original_excel_row", sort=True)
+    summary = grouped.agg(
+        true_value=("true_value", "first"),
+        prediction_mean=("predicted_value", "mean"),
+        prediction_std=("predicted_value", lambda values: values.std(ddof=1)),
+        prediction_variance=(
+            "predicted_value", lambda values: values.var(ddof=1)
+        ),
+        prediction_count=("predicted_value", "size"),
+    ).reset_index()
+    summary["prediction_std"] = summary["prediction_std"].fillna(0.0)
+    summary["prediction_variance"] = summary["prediction_variance"].fillna(0.0)
+    summary["mean_residual"] = summary["prediction_mean"] - summary["true_value"]
+    summary["mean_abs_error"] = summary["mean_residual"].abs()
+    return summary
+
+
+def save_mean_std_scatter(sample_summary, overall):
+    y_true = sample_summary["true_value"].to_numpy()
+    y_mean = sample_summary["prediction_mean"].to_numpy()
+    y_std = sample_summary["prediction_std"].to_numpy()
+    lower = min(float(y_true.min()), float(y_mean.min()))
+    upper = max(float(y_true.max()), float(y_mean.max()))
+    padding = max((upper - lower) * 0.04, 1.0e-6)
+    fig, ax = plt.subplots(figsize=(8.5, 7.5))
+    ax.errorbar(
+        y_true,
+        y_mean,
+        yerr=y_std,
+        fmt="none",
+        ecolor="#8c99a4",
+        elinewidth=0.45,
+        alpha=0.22,
+        capsize=0,
+        zorder=1,
+    )
+    points = ax.scatter(
+        y_true,
+        y_mean,
+        c=y_std,
+        cmap="viridis",
+        s=18,
+        alpha=0.72,
+        edgecolors="none",
+        zorder=2,
+        label="Mean test prediction",
+    )
+    ax.plot(
+        [lower - padding, upper + padding],
+        [lower - padding, upper + padding],
+        "r--",
+        linewidth=1.5,
+        label="Ideal",
+        zorder=3,
+    )
+    sample_mean_r2 = r2_score(y_true, y_mean)
+    fold_mean_r2 = overall.loc[0, "mean_r2_50"]
+    fold_std_r2 = overall.loc[0, "std_r2_50"]
+    colorbar = fig.colorbar(points, ax=ax)
+    colorbar.set_label("Prediction standard deviation")
+    ax.set_xlabel(f"Measured {TARGET_NAME}")
+    ax.set_ylabel(f"Mean test prediction of {TARGET_NAME}")
+    ax.set_title(
+        f"ANN: sample mean R2={sample_mean_r2:.4f}; "
+        f"fold R2={fold_mean_r2:.4f} +/- {fold_std_r2:.4f}\n"
+        "Error bars show +/- 1 prediction standard deviation"
+    )
+    ax.grid(alpha=0.25)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(BEST_MODEL_SCATTER_PATH, dpi=300)
+    plt.close(fig)
+
+
+def save_seed_best_fold_plots(final_folds, fold_artifacts, y):
+    SEED_BEST_PLOT_DIR.mkdir(parents=True, exist_ok=True)
+    best_rows = (
+        final_folds.sort_values(["seed", "test_r2"], ascending=[True, False])
+        .groupby("seed", sort=True, as_index=False)
+        .head(1)
+        .sort_values("seed")
+    )
+    records = []
+    for _, row in best_rows.iterrows():
+        seed = int(row["seed"])
+        fold = int(row["fold"])
+        artifact = fold_artifacts[(seed, fold)]
+        train_idx = artifact["train_idx"]
+        test_idx = artifact["test_idx"]
+        train_prediction = artifact["train_prediction"]
+        test_prediction = artifact["test_prediction"]
+        train_metrics = metric_values(y[train_idx], train_prediction)
+        test_metrics = metric_values(y[test_idx], test_prediction)
+        all_true = np.concatenate([y[train_idx], y[test_idx]])
+        all_prediction = np.concatenate([train_prediction, test_prediction])
+        lower = min(float(all_true.min()), float(all_prediction.min()))
+        upper = max(float(all_true.max()), float(all_prediction.max()))
+        padding = max((upper - lower) * 0.04, 1.0e-6)
+        fig, ax = plt.subplots(figsize=(8, 7))
+        ax.scatter(
+            y[train_idx],
+            train_prediction,
+            s=18,
+            alpha=0.48,
+            color="#2878b5",
+            label=f"Train (R2={train_metrics['r2']:.4f})",
+        )
+        ax.scatter(
+            y[test_idx],
+            test_prediction,
+            s=26,
+            alpha=0.78,
+            color="#d95f02",
+            label=f"Test (R2={test_metrics['r2']:.4f})",
+        )
+        ax.plot(
+            [lower - padding, upper + padding],
+            [lower - padding, upper + padding],
+            "k--",
+            linewidth=1.4,
+            label="Ideal",
+        )
+        ax.set_xlabel(f"Measured {TARGET_NAME}")
+        ax.set_ylabel(f"Predicted {TARGET_NAME}")
+        ax.set_title(
+            f"Seed {seed}, best fold {fold}, epoch {artifact['best_epoch']}"
+        )
+        ax.grid(alpha=0.25)
+        ax.legend()
+        fig.tight_layout()
+        plot_path = SEED_BEST_PLOT_DIR / f"seed_{seed}_best_fold_{fold}.png"
+        fig.savefig(plot_path, dpi=300)
+        if seed == 42:
+            fig.savefig(SEED42_BEST_FOLD_PATH, dpi=300)
+        plt.close(fig)
+        records.append(
+            {
+                "seed": seed,
+                "best_fold": fold,
+                "best_epoch": artifact["best_epoch"],
+                "train_r2": train_metrics["r2"],
+                "train_mae": train_metrics["mae"],
+                "train_rmse": train_metrics["rmse"],
+                "test_r2": test_metrics["r2"],
+                "test_mae": test_metrics["mae"],
+                "test_rmse": test_metrics["rmse"],
+                "plot_path": str(plot_path),
+                "seed42_separate_plot": seed == 42,
+            }
+        )
+    return pd.DataFrame(records)
+
+
+def main():
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    MODEL_SAVE_DIR.mkdir(parents=True, exist_ok=True)
+    device = resolve_device()
+    set_seed(BO_RANDOM_STATE)
+    X_scaled, y, excel_rows, scaler = load_data()
+    final_seeds = active_final_seeds()
+    final_n_splits = active_final_n_splits()
+    bo_split_records = make_cv_splits(
+        X_scaled,
+        [BO_SELECTION_SEED],
+        BO_SELECTION_N_SPLITS,
+    )
+    final_split_records = make_cv_splits(
+        X_scaled,
+        final_seeds,
+        final_n_splits,
+    )
+    print(
+        f"[ANN | {TARGET_NAME}] Global Bayesian optimization: "
+        f"{INIT_POINTS + NUM_ITER} candidates x "
+        f"seed {BO_SELECTION_SEED}/{len(bo_split_records)} folds x "
+        f"{BO_EPOCHS} epochs; final repeated CV="
+        f"{len(final_seeds)} x {final_n_splits}; device={device}",
+        flush=True,
+    )
+    best_params, best_trial, trials, bo_fold_details = (
+        run_global_bayesian_optimization(
+            X_scaled, y, bo_split_records, device
+        )
+    )
+    final_folds, predictions, fold_artifacts = fit_final_folds(
+        X_scaled,
+        y,
+        excel_rows,
+        scaler,
+        final_split_records,
+        best_params,
+        device,
+    )
+
+    expected_folds = len(final_seeds) * final_n_splits
+    if len(final_folds) != expected_folds:
+        raise AssertionError(
+            f"Expected {expected_folds} final folds, got {len(final_folds)}."
+        )
+    if final_folds["parameters_json"].nunique() != 1:
+        raise AssertionError("Final folds do not share one global parameter set.")
+    overall = summarize_final_folds(final_folds)
+    sample_summary = build_sample_prediction_summary(predictions)
+    if (
+        final_seeds == FINAL_CV_SEEDS
+        and final_n_splits == FINAL_N_SPLITS
+    ):
+        if not sample_summary["prediction_count"].eq(len(FINAL_CV_SEEDS)).all():
+            raise AssertionError("Every sample must have 10 final test predictions.")
+    seed_best_folds = save_seed_best_fold_plots(final_folds, fold_artifacts, y)
+    global_best = pd.DataFrame(
+        [
+            {
+                "model": MODEL_NAME,
+                "target": TARGET_NAME,
+                "best_trial": int(best_trial["trial"]),
+                "bo_selection_seed": BO_SELECTION_SEED,
+                "bo_selection_fold_count": len(bo_split_records),
+                "mean_test_r2": best_trial["mean_test_r2"],
+                "mean_test_rmse": best_trial["mean_test_rmse"],
+                "parameters_json": json.dumps(
+                    best_params, ensure_ascii=False, sort_keys=True
+                ),
+                **best_params,
+            }
+        ]
+    )
+    configuration = pd.DataFrame(
+        [
+            {"setting": "file", "value": str(FILE)},
+            {"setting": "target", "value": TARGET_NAME},
+            {"setting": "model", "value": MODEL_NAME},
+            {"setting": "device", "value": str(device)},
+            {
+                "setting": "bo_selection_seed",
+                "value": BO_SELECTION_SEED,
+            },
+            {
+                "setting": "bo_selection_n_splits",
+                "value": BO_SELECTION_N_SPLITS,
+            },
+            {
+                "setting": "bo_selection_fold_count",
+                "value": len(bo_split_records),
+            },
+            {
+                "setting": "final_cv_seeds",
+                "value": json.dumps(final_seeds),
+            },
+            {
+                "setting": "final_n_splits",
+                "value": final_n_splits,
+            },
+            {
+                "setting": "final_repeated_cv_count",
+                "value": len(final_seeds),
+            },
+            {
+                "setting": "final_fold_count",
+                "value": len(final_split_records),
+            },
+            {"setting": "init_points", "value": INIT_POINTS},
+            {"setting": "num_iter", "value": NUM_ITER},
+            {
+                "setting": "bo_candidate_count",
+                "value": INIT_POINTS + NUM_ITER,
+            },
+            {"setting": "bo_epochs", "value": BO_EPOCHS},
+            {"setting": "final_epochs", "value": FINAL_EPOCHS},
+            {"setting": "one_global_parameter_set", "value": True},
+            {"setting": "test_folds_used_for_global_bo", "value": True},
+            {
+                "setting": "bo_uses_seed42_folds_only",
+                "value": BO_SELECTION_SEED == 42,
+            },
+            {
+                "setting": "seed42_test_folds_used_for_global_bo",
+                "value": True,
+            },
+            {
+                "setting": "all_final_test_folds_used_for_global_bo",
+                "value": False,
+            },
+            {
+                "setting": "test_fold_used_for_epoch_selection",
+                "value": True,
+            },
+            {
+                "setting": "preprocessing_fit_scope",
+                "value": "full_target_dataset_before_cv",
+            },
+            {"setting": "target_scaled", "value": False},
+            {"setting": "input_missing_value_fill", "value": 0.0},
+            {"setting": "input_column_slice", "value": "1:30"},
+            {"setting": "parameter_bounds", "value": json.dumps(PBOUNDS)},
+            {"setting": "batch_candidates", "value": json.dumps(BATCH_CANDIDATES)},
+            {
+                "setting": "metric_interpretation",
+                "value": (
+                    "exploratory: seed42 test folds selected hyperparameters, "
+                    "then the same dataset was reused for 10x5 repeated CV; "
+                    "each final test fold also selected its best epoch"
+                ),
+            },
+        ]
+    )
+
+    with pd.ExcelWriter(BO_RESULTS_PATH, engine="openpyxl") as writer:
+        overall.to_excel(writer, sheet_name="Overall_Statistics", index=False)
+        global_best.to_excel(
+            writer, sheet_name="Global_Best_Parameters", index=False
+        )
+        trials.to_excel(writer, sheet_name="All_Global_BO_Trials", index=False)
+        bo_fold_details.to_excel(
+            writer, sheet_name="Global_BO_Fold_Details", index=False
+        )
+        final_folds.to_excel(
+            writer, sheet_name="Final_Fold_Metrics_50", index=False
+        )
+        predictions.to_excel(
+            writer, sheet_name="Final_Test_Predictions", index=False
+        )
+        sample_summary.to_excel(
+            writer, sheet_name="Sample_Mean_Std", index=False
+        )
+        seed_best_folds.to_excel(
+            writer, sheet_name="Seed_Best_Folds", index=False
+        )
+        configuration.to_excel(writer, sheet_name="Configuration", index=False)
+
+    with pd.ExcelWriter(STATISTICS_PATH, engine="openpyxl") as writer:
+        overall.to_excel(writer, sheet_name="Overall_Statistics", index=False)
+        global_best.to_excel(
+            writer, sheet_name="Global_Best_Parameters", index=False
+        )
+        final_folds.to_excel(
+            writer, sheet_name="Final_Fold_Metrics_50", index=False
+        )
+        seed_best_folds.to_excel(
+            writer, sheet_name="Seed_Best_Folds", index=False
+        )
+    with pd.ExcelWriter(BEST_MODEL_PREDICTIONS_PATH, engine="openpyxl") as writer:
+        predictions.to_excel(
+            writer, sheet_name="Final_Test_Predictions", index=False
+        )
+        sample_summary.to_excel(
+            writer, sheet_name="Sample_Mean_Std", index=False
+        )
+    save_mean_std_scatter(sample_summary, overall)
+    print(overall.to_string(index=False))
+    print(f"Global best parameters: {global_best.loc[0, 'parameters_json']}")
+    print(f"Saved: {BO_RESULTS_PATH}")
+    print(f"Saved: {STATISTICS_PATH}")
+    print(f"Saved: {BEST_MODEL_PREDICTIONS_PATH}")
+    print(f"Saved: {BEST_MODEL_SCATTER_PATH}")
+
+
+if __name__ == "__main__":
+    main()
