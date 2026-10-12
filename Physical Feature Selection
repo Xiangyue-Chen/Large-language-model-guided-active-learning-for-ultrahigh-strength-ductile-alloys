@@ -1,0 +1,1153 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import os
+import sys
+from collections.abc import Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pandas as pd
+import matplotlib
+
+matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt
+from joblib import Parallel, delayed
+from lightgbm import LGBMRegressor
+from matplotlib.patches import Rectangle
+from openpyxl.formatting.rule import ColorScaleRule
+from openpyxl.styles import Alignment, Font, PatternFill
+from scipy.cluster.hierarchy import leaves_list, linkage
+from scipy.spatial.distance import squareform
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import KFold
+
+
+DATA_FILE = Path(
+    "C:/Users/Administrator/Desktop/项目/数据库/HEA-物理特征版.xlsx"
+)
+SHEET_NAME = "Sheet1"
+BASE_POSITIONS = tuple(range(1, 30))
+PHYSICAL_POSITIONS = tuple(range(30, 79))
+TARGET_NAMES = ("yield", "elongation")
+CORRELATION_THRESHOLD = 0.95
+CV_SEEDS = tuple(range(40, 50))
+N_SPLITS = 5
+DEFAULT_JOBS = max(1, min(8, os.cpu_count() or 1))
+DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "结果_阈值0.95_10seed五折"
+HEATMAP_ANNOTATION_THRESHOLD = 0.0
+HEATMAP_BUBBLE_AREA_SCALE = 600.0
+HEATMAP_TICK_FONT_SIZE = 16
+HEATMAP_ANNOTATION_FONT_SIZE = 11
+PATH_TICK_FONT_SIZE = 13
+AXIS_LABEL_FONT_SIZE = 18
+PLOT_TITLE_FONT_SIZE = 18
+
+PHYSICAL_DISPLAY_ALIASES = {
+    "AW": "AW",
+    "R": "R",
+    "Vₐ": "Vₐ",
+    "ρ": "ρ",
+    "Tₘ": "Tₘ",
+    "χₚ": "χₚ",
+    "VEC": "VEC",
+    "δr (Yang delta)": "δr",
+    "Ω (Yang omega)": "Ω",
+    "Dᵣ (radii local mismatch)": "Dᵣ",
+    "γᵣ (radii gamma)": "γᵣ",
+    "ΔSconfig": "ΔSmix",
+    "Λentropy": "Λentropy",
+    "δχ": "δχ",
+    "Dχ": "Dχ",
+    "ΔHmix": "ΔHmix",
+    "Ec": "Ec",
+    "DR": "DR",
+    "δTₘ": "δTₘ",
+    "δVEC": "δVEC",
+    "δρ": "δρ",
+    "DEc": "DEc",
+    "δEc": "δEc",
+    "χA": "χA",
+    "ΔχA": "ΔχA",
+}
+
+FIXED_LGBM_PARAMS: dict[str, Any] = {
+    "objective": "regression",
+    "boosting_type": "gbdt",
+    "n_estimators": 600,
+    "learning_rate": 0.05,
+    "num_leaves": 63,
+    "max_depth": 12,
+    "min_child_samples": 15,
+    "colsample_bytree": 1.0,
+    "subsample": 1.0,
+    "subsample_freq": 0,
+    "reg_alpha": 1.0,
+    "reg_lambda": 5.0,
+    "max_bin": 255,
+}
+
+
+PAIR_COLUMNS = ["feature_a", "feature_b", "correlation", "abs_correlation"]
+REMOVAL_COLUMNS = [
+    "representative",
+    "removed_feature",
+    "group_id",
+    "correlation_to_representative",
+    "abs_correlation_to_representative",
+    "reason",
+]
+
+
+@dataclass
+class DataBundle:
+    base_names: list[str]
+    physical_names: list[str]
+    base_matrix: np.ndarray
+    physical_matrix: np.ndarray
+    targets: dict[str, np.ndarray]
+    valid_masks: dict[str, np.ndarray]
+    excel_rows: np.ndarray
+
+
+@dataclass
+class TargetResult:
+    target_name: str
+    selected_features: list[str]
+    remaining_features: list[str]
+    path: pd.DataFrame
+    candidate_metrics: pd.DataFrame
+    fold_metrics: pd.DataFrame
+    seed_metrics: pd.DataFrame
+    removals: pd.DataFrame
+    output_dir: Path
+
+
+class _UnionFind:
+    def __init__(self, names: Sequence[str]) -> None:
+        self.parent = {name: name for name in names}
+
+    def find(self, name: str) -> str:
+        parent = self.parent[name]
+        if parent != name:
+            self.parent[name] = self.find(parent)
+        return self.parent[name]
+
+    def union(self, first: str, second: str) -> None:
+        first_root = self.find(first)
+        second_root = self.find(second)
+        if first_root != second_root:
+            self.parent[second_root] = first_root
+
+
+def build_redundancy_groups(
+    correlation: pd.DataFrame,
+    threshold: float,
+) -> tuple[dict[str, list[str]], dict[str, str], pd.DataFrame]:
+    if list(correlation.index) != list(correlation.columns):
+        raise ValueError("correlation matrix index and columns must match")
+    if not 0.0 < float(threshold) <= 1.0:
+        raise ValueError("threshold must be in (0, 1]")
+
+    names = [str(name) for name in correlation.columns]
+    union_find = _UnionFind(names)
+    pair_rows: list[dict[str, float | str]] = []
+    for left_index, left in enumerate(names):
+        for right in names[left_index + 1 :]:
+            value = float(correlation.loc[left, right])
+            if pd.notna(value) and abs(value) >= float(threshold):
+                union_find.union(left, right)
+                pair_rows.append(
+                    {
+                        "feature_a": left,
+                        "feature_b": right,
+                        "correlation": value,
+                        "abs_correlation": abs(value),
+                    }
+                )
+
+    components: dict[str, list[str]] = {}
+    for name in names:
+        components.setdefault(union_find.find(name), []).append(name)
+    redundant_components = [members for members in components.values() if len(members) >= 2]
+
+    groups: dict[str, list[str]] = {}
+    group_by_feature: dict[str, str] = {}
+    for group_number, members in enumerate(redundant_components, start=1):
+        group_id = f"G{group_number:03d}"
+        groups[group_id] = members
+        group_by_feature.update({member: group_id for member in members})
+
+    pairs = pd.DataFrame(pair_rows, columns=PAIR_COLUMNS)
+    if not pairs.empty:
+        pairs = pairs.sort_values(
+            ["abs_correlation", "feature_a", "feature_b"],
+            ascending=[False, True, True],
+        ).reset_index(drop=True)
+    return groups, group_by_feature, pairs
+
+
+def choose_round_winner(candidate_metrics: pd.DataFrame) -> pd.Series:
+    required = {"candidate", "oof_rmse", "oof_r2"}
+    missing = required.difference(candidate_metrics.columns)
+    if missing:
+        raise KeyError(f"candidate metrics are missing columns: {sorted(missing)}")
+    if candidate_metrics.empty:
+        raise ValueError("candidate metrics must not be empty")
+    rmse_column = (
+        "mean_seed_oof_rmse"
+        if "mean_seed_oof_rmse" in candidate_metrics.columns
+        else "oof_rmse"
+    )
+    r2_column = (
+        "mean_seed_oof_r2"
+        if "mean_seed_oof_r2" in candidate_metrics.columns
+        else "oof_r2"
+    )
+    ranked = candidate_metrics.sort_values(
+        [rmse_column, r2_column, "candidate"],
+        ascending=[True, False, True],
+        kind="mergesort",
+    )
+    return ranked.iloc[0].copy()
+
+
+def apply_dynamic_pruning(
+    winner: str,
+    remaining: Sequence[str],
+    group_by_feature: dict[str, str],
+    groups: dict[str, list[str]],
+    correlation: pd.DataFrame,
+) -> tuple[list[str], pd.DataFrame]:
+    if winner not in remaining:
+        raise ValueError(f"winner is not an active candidate: {winner}")
+
+    group_id = group_by_feature.get(winner)
+    group_members = set(groups.get(group_id, [])) if group_id else {winner}
+    removed_features = [
+        feature for feature in remaining if feature != winner and feature in group_members
+    ]
+    next_remaining = [
+        feature for feature in remaining if feature != winner and feature not in group_members
+    ]
+
+    rows = []
+    for feature in removed_features:
+        value = float(correlation.loc[winner, feature])
+        rows.append(
+            {
+                "representative": winner,
+                "removed_feature": feature,
+                "group_id": group_id,
+                "correlation_to_representative": value,
+                "abs_correlation_to_representative": abs(value),
+                "reason": "same_pearson_connected_component",
+            }
+        )
+    return next_remaining, pd.DataFrame(rows, columns=REMOVAL_COLUMNS)
+
+
+def build_data_bundle(
+    frame: pd.DataFrame,
+    base_positions: Sequence[int] = BASE_POSITIONS,
+    physical_positions: Sequence[int] = PHYSICAL_POSITIONS,
+    target_names: Sequence[str] = TARGET_NAMES,
+) -> DataBundle:
+    base_positions = [int(position) for position in base_positions]
+    physical_positions = [int(position) for position in physical_positions]
+    all_positions = base_positions + physical_positions
+    if not all_positions:
+        raise ValueError("at least one input feature is required")
+    if min(all_positions) < 0 or max(all_positions) >= frame.shape[1]:
+        raise IndexError("feature position is outside the workbook schema")
+    if set(base_positions).intersection(physical_positions):
+        raise ValueError("base and physical feature positions overlap")
+
+    missing_targets = [name for name in target_names if name not in frame.columns]
+    if missing_targets:
+        raise KeyError(f"target columns are missing: {missing_targets}")
+
+    base_frame = frame.iloc[:, base_positions].apply(pd.to_numeric, errors="coerce")
+    physical_frame = frame.iloc[:, physical_positions].apply(pd.to_numeric, errors="coerce")
+    base_names = [str(name) for name in base_frame.columns]
+    physical_names = [str(name) for name in physical_frame.columns]
+    if len(set(base_names + physical_names)) != len(base_names) + len(physical_names):
+        raise ValueError("input feature names must be unique")
+    forbidden = set(target_names).intersection(base_names + physical_names)
+    if forbidden:
+        raise ValueError(f"target columns leaked into the feature matrix: {sorted(forbidden)}")
+    if base_frame.isna().all(axis=0).any() or physical_frame.isna().all(axis=0).any():
+        raise ValueError("an input feature contains no numeric values")
+
+    targets: dict[str, np.ndarray] = {}
+    valid_masks: dict[str, np.ndarray] = {}
+    for target_name in target_names:
+        values = pd.to_numeric(frame[target_name], errors="coerce").to_numpy(dtype=float)
+        targets[str(target_name)] = values
+        valid_masks[str(target_name)] = np.isfinite(values)
+
+    return DataBundle(
+        base_names=base_names,
+        physical_names=physical_names,
+        base_matrix=base_frame.to_numpy(dtype=float),
+        physical_matrix=physical_frame.to_numpy(dtype=float),
+        targets=targets,
+        valid_masks=valid_masks,
+        excel_rows=np.arange(2, len(frame) + 2, dtype=int),
+    )
+
+
+def load_workbook_data(path: Path | str = DATA_FILE) -> tuple[pd.DataFrame, DataBundle]:
+    source = Path(path)
+    if not source.exists():
+        raise FileNotFoundError(source)
+    frame = pd.read_excel(source, sheet_name=SHEET_NAME)
+    bundle = build_data_bundle(frame)
+    if len(bundle.base_names) != 29 or len(bundle.physical_names) != 49:
+        raise ValueError(
+            f"expected 29 base and 49 physical features, got "
+            f"{len(bundle.base_names)} and {len(bundle.physical_names)}"
+        )
+    return frame, bundle
+
+
+def regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
+    return {
+        "r2": float(r2_score(y_true, y_pred)),
+        "mae": float(mean_absolute_error(y_true, y_pred)),
+        "rmse": float(math.sqrt(mean_squared_error(y_true, y_pred))),
+    }
+
+
+def model_random_state(seed: int, fold: int) -> int:
+    return int(seed) * 100 + int(fold)
+
+
+def make_cv_splits(
+    sample_count: int,
+    seeds: Sequence[int] = CV_SEEDS,
+    n_splits: int = N_SPLITS,
+) -> list[dict[str, Any]]:
+    sample_count = int(sample_count)
+    n_splits = int(n_splits)
+    normalized_seeds = tuple(int(seed) for seed in seeds)
+    if not normalized_seeds:
+        raise ValueError("at least one CV seed is required")
+    if len(set(normalized_seeds)) != len(normalized_seeds):
+        raise ValueError("CV seeds must be unique")
+    if n_splits < 2 or n_splits > sample_count:
+        raise ValueError(
+            f"n_splits must be between 2 and {sample_count}, got {n_splits}"
+        )
+
+    placeholder = np.zeros(sample_count, dtype=np.uint8)
+    records: list[dict[str, Any]] = []
+    for seed in normalized_seeds:
+        splitter = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
+        for fold, (train_indices, validation_indices) in enumerate(
+            splitter.split(placeholder), start=1
+        ):
+            records.append(
+                {
+                    "seed": seed,
+                    "fold": int(fold),
+                    "model_random_state": model_random_state(seed, fold),
+                    "train_idx": train_indices,
+                    "validation_idx": validation_indices,
+                }
+            )
+    return records
+
+
+def evaluate_feature_matrix(
+    matrix: np.ndarray,
+    target: np.ndarray,
+    splits: Sequence[dict[str, Any]],
+    model_params: dict[str, Any] | None = None,
+) -> tuple[dict[str, float], pd.DataFrame, pd.DataFrame]:
+    parameters = dict(FIXED_LGBM_PARAMS if model_params is None else model_params)
+    if len(matrix) != len(target):
+        raise ValueError("matrix and target must contain the same number of samples")
+    if not splits:
+        raise ValueError("splits must not be empty")
+    matrix_array = np.asarray(matrix, dtype=float)
+    if matrix_array.ndim != 2:
+        raise ValueError("matrix must be two-dimensional")
+    feature_frame = pd.DataFrame(
+        matrix_array,
+        columns=[f"feature_{index:04d}" for index in range(matrix_array.shape[1])],
+    )
+
+    seed_order: list[int] = []
+    seed_predictions: dict[int, np.ndarray] = {}
+    seed_validation_counts: dict[int, np.ndarray] = {}
+    fold_rows: list[dict[str, float | int]] = []
+    for split in splits:
+        seed = int(split["seed"])
+        fold_number = int(split["fold"])
+        train_indices = np.asarray(split["train_idx"], dtype=int)
+        validation_indices = np.asarray(split["validation_idx"], dtype=int)
+        random_state = int(
+            split.get(
+                "model_random_state",
+                model_random_state(seed, fold_number),
+            )
+        )
+        if seed not in seed_predictions:
+            seed_order.append(seed)
+            seed_predictions[seed] = np.full(len(target), np.nan, dtype=float)
+            seed_validation_counts[seed] = np.zeros(len(target), dtype=int)
+
+        model = LGBMRegressor(
+            **parameters,
+            random_state=random_state,
+            n_jobs=1,
+            verbosity=-1,
+            deterministic=True,
+            force_col_wise=True,
+        )
+        model.fit(feature_frame.iloc[train_indices], target[train_indices])
+        prediction = model.predict(feature_frame.iloc[validation_indices])
+        seed_predictions[seed][validation_indices] = prediction
+        seed_validation_counts[seed][validation_indices] += 1
+        metrics = regression_metrics(target[validation_indices], prediction)
+        fold_rows.append(
+            {
+                "seed": seed,
+                "fold": int(fold_number),
+                "model_random_state": random_state,
+                "train_count": int(len(train_indices)),
+                "validation_count": int(len(validation_indices)),
+                **metrics,
+            }
+        )
+
+    seed_rows: list[dict[str, float | int]] = []
+    for seed in seed_order:
+        validation_counts = seed_validation_counts[seed]
+        if not np.equal(validation_counts, 1).all():
+            raise RuntimeError(
+                f"OOF validation coverage for seed {seed} must equal one per sample"
+            )
+        prediction = seed_predictions[seed]
+        if not np.isfinite(prediction).all():
+            raise RuntimeError(f"OOF predictions are incomplete for seed {seed}")
+        metrics = regression_metrics(target, prediction)
+        seed_rows.append(
+            {
+                "seed": seed,
+                "fold_count": int(
+                    sum(int(row["seed"]) == seed for row in fold_rows)
+                ),
+                "oof_r2": metrics["r2"],
+                "oof_mae": metrics["mae"],
+                "oof_rmse": metrics["rmse"],
+            }
+        )
+
+    fold_table = pd.DataFrame(fold_rows)
+    seed_table = pd.DataFrame(seed_rows)
+
+    def mean(column: pd.Series) -> float:
+        return float(column.mean())
+
+    def sample_std(column: pd.Series) -> float:
+        return float(column.std(ddof=1)) if len(column) > 1 else 0.0
+
+    summary = {
+        "oof_r2": mean(seed_table["oof_r2"]),
+        "oof_mae": mean(seed_table["oof_mae"]),
+        "oof_rmse": mean(seed_table["oof_rmse"]),
+        "mean_seed_oof_r2": mean(seed_table["oof_r2"]),
+        "std_seed_oof_r2": sample_std(seed_table["oof_r2"]),
+        "mean_seed_oof_mae": mean(seed_table["oof_mae"]),
+        "std_seed_oof_mae": sample_std(seed_table["oof_mae"]),
+        "mean_seed_oof_rmse": mean(seed_table["oof_rmse"]),
+        "std_seed_oof_rmse": sample_std(seed_table["oof_rmse"]),
+        "mean_fold_r2": mean(fold_table["r2"]),
+        "std_fold_r2": sample_std(fold_table["r2"]),
+        "mean_fold_mae": mean(fold_table["mae"]),
+        "mean_fold_rmse": mean(fold_table["rmse"]),
+        "std_fold_rmse": sample_std(fold_table["rmse"]),
+    }
+    return summary, fold_table, seed_table
+
+
+def _evaluate_candidate(
+    candidate: str,
+    candidate_index: int,
+    selected_indices: Sequence[int],
+    base: np.ndarray,
+    physical: np.ndarray,
+    target: np.ndarray,
+    splits: Sequence[dict[str, Any]],
+    model_params: dict[str, Any],
+) -> tuple[dict[str, float | str | int], pd.DataFrame, pd.DataFrame]:
+    active_indices = [*selected_indices, int(candidate_index)]
+    matrix = np.hstack([base, physical[:, active_indices]])
+    summary, folds, seeds = evaluate_feature_matrix(matrix, target, splits, model_params)
+    return (
+        {"candidate": candidate, "candidate_index": int(candidate_index), **summary},
+        folds,
+        seeds,
+    )
+
+
+def _configuration_hash(
+    bundle: DataBundle,
+    target_name: str,
+    groups: dict[str, list[str]],
+    model_params: dict[str, Any],
+    cv_seeds: Sequence[int] = CV_SEEDS,
+    n_splits: int = N_SPLITS,
+) -> str:
+    payload = {
+        "target_name": target_name,
+        "base_names": bundle.base_names,
+        "physical_names": bundle.physical_names,
+        "groups": groups,
+        "model_params": model_params,
+        "cv_seeds": [int(seed) for seed in cv_seeds],
+        "n_splits": int(n_splits),
+    }
+    encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _save_checkpoint(path: Path, payload: dict[str, Any]) -> None:
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def _read_table(path: Path, columns: Sequence[str] | None = None) -> pd.DataFrame:
+    if path.exists():
+        return pd.read_csv(path)
+    return pd.DataFrame(columns=list(columns or []))
+
+
+def run_target_selection(
+    bundle: DataBundle,
+    target_name: str,
+    correlation: pd.DataFrame,
+    groups: dict[str, list[str]],
+    group_by_feature: dict[str, str],
+    output_dir: Path | str,
+    max_rounds: int | None = None,
+    jobs: int = DEFAULT_JOBS,
+    model_params: dict[str, Any] | None = None,
+    cv_seeds: Sequence[int] = CV_SEEDS,
+    n_splits: int = N_SPLITS,
+) -> TargetResult:
+    if target_name not in bundle.targets:
+        raise KeyError(f"unknown target: {target_name}")
+    destination = Path(output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    parameters = dict(FIXED_LGBM_PARAMS if model_params is None else model_params)
+    valid = bundle.valid_masks[target_name]
+    base = bundle.base_matrix[valid]
+    physical = bundle.physical_matrix[valid]
+    target = bundle.targets[target_name][valid]
+    normalized_seeds = tuple(int(seed) for seed in cv_seeds)
+    n_splits = int(n_splits)
+    splits = make_cv_splits(len(target), seeds=normalized_seeds, n_splits=n_splits)
+    config_hash = _configuration_hash(
+        bundle,
+        target_name,
+        groups,
+        parameters,
+        cv_seeds=normalized_seeds,
+        n_splits=n_splits,
+    )
+
+    checkpoint_path = destination / "checkpoint.json"
+    path_file = destination / "selection_path.csv"
+    candidate_file = destination / "candidate_metrics.csv"
+    fold_file = destination / "candidate_fold_metrics.csv"
+    seed_file = destination / "candidate_seed_metrics.csv"
+    removal_file = destination / "redundancy_removals.csv"
+
+    if checkpoint_path.exists():
+        checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        if checkpoint.get("config_hash") != config_hash:
+            raise ValueError(f"checkpoint configuration mismatch: {checkpoint_path}")
+        selected = [str(name) for name in checkpoint["selected_features"]]
+        remaining = [str(name) for name in checkpoint["remaining_features"]]
+        completed_round = int(checkpoint["completed_round"])
+        path_table = _read_table(path_file)
+        candidate_metrics = _read_table(candidate_file)
+        fold_metrics = _read_table(fold_file)
+        seed_metrics = _read_table(seed_file)
+        removals = _read_table(removal_file, ["round", *REMOVAL_COLUMNS])
+    else:
+        baseline_summary, baseline_folds, baseline_seeds = evaluate_feature_matrix(
+            base, target, splits, parameters
+        )
+        selected = []
+        remaining = list(bundle.physical_names)
+        completed_round = 0
+        path_table = pd.DataFrame(
+            [
+                {
+                    "round": 0,
+                    "physical_count": 0,
+                    "selected_feature": "BASE_FEATURES",
+                    "remaining_count": len(remaining),
+                    "redundant_removed_this_round": 0,
+                    **baseline_summary,
+                }
+            ]
+        )
+        baseline_folds.insert(0, "candidate", "BASE_FEATURES")
+        baseline_folds.insert(0, "round", 0)
+        baseline_seeds.insert(0, "candidate", "BASE_FEATURES")
+        baseline_seeds.insert(0, "round", 0)
+        candidate_metrics = pd.DataFrame()
+        fold_metrics = baseline_folds
+        seed_metrics = baseline_seeds
+        removals = pd.DataFrame(columns=["round", *REMOVAL_COLUMNS])
+        path_table.to_csv(path_file, index=False, encoding="utf-8-sig")
+        fold_metrics.to_csv(fold_file, index=False, encoding="utf-8-sig")
+        seed_metrics.to_csv(seed_file, index=False, encoding="utf-8-sig")
+        removals.to_csv(removal_file, index=False, encoding="utf-8-sig")
+        _save_checkpoint(
+            checkpoint_path,
+            {
+                "config_hash": config_hash,
+                "target_name": target_name,
+                "completed_round": 0,
+                "selected_features": selected,
+                "remaining_features": remaining,
+            },
+        )
+
+    round_limit = len(bundle.physical_names) if max_rounds is None else int(max_rounds)
+    feature_index = {name: index for index, name in enumerate(bundle.physical_names)}
+    for round_number in range(completed_round + 1, round_limit + 1):
+        if not remaining:
+            break
+        selected_indices = [feature_index[name] for name in selected]
+        print_console(
+            f"[{target_name}] round {round_number}; selected={len(selected)}; "
+            f"candidates={len(remaining)}"
+        )
+        evaluated = Parallel(n_jobs=int(jobs), prefer="threads")(
+            delayed(_evaluate_candidate)(
+                candidate,
+                feature_index[candidate],
+                selected_indices,
+                base,
+                physical,
+                target,
+                splits,
+                parameters,
+            )
+            for candidate in remaining
+        )
+        round_candidates = pd.DataFrame([summary for summary, _, _ in evaluated])
+        round_candidates.insert(0, "round", int(round_number))
+        round_folds = []
+        round_seeds = []
+        for summary, folds, seeds in evaluated:
+            table = folds.copy()
+            table.insert(0, "candidate", str(summary["candidate"]))
+            table.insert(0, "round", int(round_number))
+            round_folds.append(table)
+            seed_table = seeds.copy()
+            seed_table.insert(0, "candidate", str(summary["candidate"]))
+            seed_table.insert(0, "round", int(round_number))
+            round_seeds.append(seed_table)
+        round_fold_table = pd.concat(round_folds, ignore_index=True)
+        round_seed_table = pd.concat(round_seeds, ignore_index=True)
+        winner = choose_round_winner(round_candidates)
+        winner_name = str(winner["candidate"])
+        next_remaining, round_removals = apply_dynamic_pruning(
+            winner_name,
+            remaining,
+            group_by_feature,
+            groups,
+            correlation,
+        )
+        if not round_removals.empty:
+            round_removals.insert(0, "round", int(round_number))
+        selected.append(winner_name)
+        remaining = next_remaining
+
+        path_row = {
+            "round": int(round_number),
+            "physical_count": len(selected),
+            "selected_feature": winner_name,
+            "remaining_count": len(remaining),
+            "redundant_removed_this_round": len(round_removals),
+            **{
+                key: winner[key]
+                for key in winner.index
+                if key.startswith("oof_")
+                or key.startswith("mean_seed_")
+                or key.startswith("std_seed_")
+                or key.startswith("mean_fold_")
+                or key.startswith("std_fold_")
+            },
+        }
+        path_table = pd.concat([path_table, pd.DataFrame([path_row])], ignore_index=True)
+        candidate_metrics = pd.concat(
+            [candidate_metrics, round_candidates], ignore_index=True
+        )
+        fold_metrics = pd.concat([fold_metrics, round_fold_table], ignore_index=True)
+        seed_metrics = pd.concat([seed_metrics, round_seed_table], ignore_index=True)
+        if not round_removals.empty:
+            removals = (
+                round_removals.copy()
+                if removals.empty
+                else pd.concat([removals, round_removals], ignore_index=True)
+            )
+
+        path_table.to_csv(path_file, index=False, encoding="utf-8-sig")
+        candidate_metrics.to_csv(candidate_file, index=False, encoding="utf-8-sig")
+        fold_metrics.to_csv(fold_file, index=False, encoding="utf-8-sig")
+        seed_metrics.to_csv(seed_file, index=False, encoding="utf-8-sig")
+        removals.to_csv(removal_file, index=False, encoding="utf-8-sig")
+        _save_checkpoint(
+            checkpoint_path,
+            {
+                "config_hash": config_hash,
+                "target_name": target_name,
+                "completed_round": int(round_number),
+                "selected_features": selected,
+                "remaining_features": remaining,
+            },
+        )
+        removed_names = (
+            ", ".join(round_removals["removed_feature"].astype(str))
+            if not round_removals.empty
+            else "none"
+        )
+        print_console(
+            f"[{target_name}] selected {winner_name}; mean-seed OOF RMSE="
+            f"{float(winner['mean_seed_oof_rmse']):.6f}; mean-seed OOF R2="
+            f"{float(winner['mean_seed_oof_r2']):.6f}; redundant removed={removed_names}"
+        )
+
+    return TargetResult(
+        target_name=target_name,
+        selected_features=selected,
+        remaining_features=remaining,
+        path=path_table,
+        candidate_metrics=candidate_metrics,
+        fold_metrics=fold_metrics,
+        seed_metrics=seed_metrics,
+        removals=removals,
+        output_dir=destination,
+    )
+
+
+def _clustered_feature_order(correlation: pd.DataFrame) -> list[str]:
+    names = [str(name) for name in correlation.columns]
+    if len(names) <= 2:
+        return names
+    absolute = correlation.abs().fillna(0.0).to_numpy(dtype=float)
+    distance = np.clip(1.0 - absolute, 0.0, 2.0)
+    distance = (distance + distance.T) / 2.0
+    np.fill_diagonal(distance, 0.0)
+    hierarchy = linkage(
+        squareform(distance, checks=False),
+        method="average",
+        optimal_ordering=True,
+    )
+    order = leaves_list(hierarchy)
+    return [names[int(index)] for index in order]
+
+
+def display_physical_feature_label(name: str) -> str:
+    """Return the plot-only label without changing model-facing names."""
+    internal_name = str(name)
+    return PHYSICAL_DISPLAY_ALIASES.get(internal_name, internal_name)
+
+
+def plot_pearson_heatmap(
+    correlation: pd.DataFrame,
+    output_dir: Path | str,
+    annotation_threshold: float = HEATMAP_ANNOTATION_THRESHOLD,
+    redundancy_threshold: float = CORRELATION_THRESHOLD,
+) -> list[Path]:
+    destination = Path(output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    order = _clustered_feature_order(correlation)
+    display_order = [display_physical_feature_label(name) for name in order]
+    ordered = correlation.loc[order, order]
+    values = ordered.to_numpy(dtype=float)
+    upper_mask = np.triu(np.ones_like(values, dtype=bool), k=1)
+    masked = np.ma.array(values, mask=upper_mask)
+    color_map = plt.get_cmap("coolwarm").copy()
+    color_map.set_bad("#F4F6F7")
+    size = len(order)
+    figure_width = max(13.0, 6.0 + 0.40 * size)
+    figure_height = max(12.0, 5.0 + 0.40 * size)
+    figure, axis = plt.subplots(
+        figsize=(figure_width, figure_height), constrained_layout=True
+    )
+    image = axis.imshow(masked, cmap=color_map, vmin=-1.0, vmax=1.0, aspect="equal")
+    upper_rows, upper_columns = np.triu_indices(size, k=1)
+    upper_values = values[upper_rows, upper_columns]
+    finite_upper = np.isfinite(upper_values)
+    axis.scatter(
+        upper_columns[finite_upper],
+        upper_rows[finite_upper],
+        s=np.abs(upper_values[finite_upper]) * HEATMAP_BUBBLE_AREA_SCALE,
+        c=upper_values[finite_upper],
+        cmap=color_map,
+        vmin=-1.0,
+        vmax=1.0,
+        marker="o",
+        edgecolors="#111111",
+        linewidths=0.7,
+    )
+    axis.set_xticks(
+        np.arange(size),
+        labels=display_order,
+        rotation=90,
+        fontsize=HEATMAP_TICK_FONT_SIZE,
+        fontweight="bold",
+    )
+    axis.set_yticks(
+        np.arange(size),
+        labels=display_order,
+        fontsize=HEATMAP_TICK_FONT_SIZE,
+        fontweight="bold",
+    )
+    axis.tick_params(length=0)
+    axis.set_xticks(np.arange(-0.5, size, 1.0), minor=True)
+    axis.set_yticks(np.arange(-0.5, size, 1.0), minor=True)
+    axis.grid(which="minor", color="#BFC5C9", linestyle="-", linewidth=0.45)
+    axis.tick_params(which="minor", bottom=False, left=False)
+    for row in range(size):
+        for column in range(row + 1):
+            value = values[row, column]
+            if np.isfinite(value) and abs(value) >= annotation_threshold:
+                text_color = "white" if abs(value) >= 0.72 else "#17202A"
+                axis.text(
+                    column,
+                    row,
+                    f"{value:.2f}",
+                    ha="center",
+                    va="center",
+                    fontsize=HEATMAP_ANNOTATION_FONT_SIZE,
+                    fontweight="bold",
+                    color=text_color,
+                )
+            if row != column and np.isfinite(value) and abs(value) >= redundancy_threshold:
+                axis.add_patch(
+                    Rectangle(
+                        (column - 0.5, row - 0.5),
+                        1.0,
+                        1.0,
+                        fill=False,
+                        edgecolor="#111111",
+                        linewidth=1.2,
+                    )
+                )
+    color_bar = figure.colorbar(image, ax=axis, shrink=0.78, pad=0.02)
+    color_bar.set_label(
+        "Pearson r",
+        rotation=270,
+        labelpad=22,
+        fontsize=AXIS_LABEL_FONT_SIZE,
+        fontweight="bold",
+    )
+    color_bar.ax.tick_params(labelsize=HEATMAP_TICK_FONT_SIZE)
+    for tick_label in color_bar.ax.get_yticklabels():
+        tick_label.set_fontweight("bold")
+    axis.spines[:].set_visible(False)
+
+    paths = [
+        destination / "物理特征_Pearson相关性热图.png",
+        destination / "物理特征_Pearson相关性热图.pdf",
+    ]
+    figure.savefig(paths[0], dpi=300, facecolor="white")
+    figure.savefig(paths[1], facecolor="white")
+    plt.close(figure)
+    return paths
+
+
+def plot_selection_path(
+    path_table: pd.DataFrame,
+    target_name: str,
+    output_dir: Path | str,
+) -> Path:
+    required = {"physical_count", "oof_rmse", "selected_feature"}
+    missing = required.difference(path_table.columns)
+    if missing:
+        raise KeyError(f"selection path is missing columns: {sorted(missing)}")
+    destination = Path(output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    ordered = path_table.sort_values("physical_count").reset_index(drop=True)
+    minimum_index = ordered["oof_rmse"].astype(float).idxmin()
+    minimum = ordered.loc[minimum_index]
+    label = "Yield strength" if target_name == "yield" else "Elongation"
+
+    figure, axis = plt.subplots(figsize=(10.2, 7.0), constrained_layout=True)
+    axis.plot(
+        ordered["physical_count"],
+        ordered["oof_rmse"],
+        color="#176B67",
+        marker="o",
+        markersize=4.5,
+        linewidth=2.0,
+    )
+    axis.scatter(
+        [minimum["physical_count"]],
+        [minimum["oof_rmse"]],
+        s=90,
+        color="#C0392B",
+        edgecolor="white",
+        linewidth=1.2,
+        zorder=4,
+        label="Minimum OOF RMSE",
+    )
+    axis.annotate(
+        f"{int(minimum['physical_count'])} descriptors\nRMSE = {float(minimum['oof_rmse']):.3f}",
+        xy=(minimum["physical_count"], minimum["oof_rmse"]),
+        xytext=(12, 15),
+        textcoords="offset points",
+        fontsize=11,
+        bbox={"boxstyle": "round,pad=0.35", "facecolor": "white", "edgecolor": "#C0392B"},
+    )
+    axis.set_xlabel(
+        "Number of selected physical descriptors", fontsize=AXIS_LABEL_FONT_SIZE
+    )
+    axis.set_ylabel(
+        "Mean seed-level five-fold OOF RMSE", fontsize=AXIS_LABEL_FONT_SIZE
+    )
+    axis.set_title(
+        f"{label}: Pearson-aware forward-selection path",
+        fontsize=PLOT_TITLE_FONT_SIZE,
+    )
+    axis.tick_params(axis="both", labelsize=PATH_TICK_FONT_SIZE)
+    axis.grid(True, linestyle="--", linewidth=0.7, alpha=0.35)
+    axis.legend(frameon=False, fontsize=12)
+    for spine in ("top", "right"):
+        axis.spines[spine].set_visible(False)
+    path = destination / f"{target_name}_RMSE动态前向选择路径.png"
+    figure.savefig(path, dpi=300, facecolor="white")
+    plt.close(figure)
+    return path
+
+
+def _groups_table(groups: dict[str, list[str]]) -> pd.DataFrame:
+    rows = []
+    for group_id, members in groups.items():
+        for position, member in enumerate(members, start=1):
+            rows.append(
+                {
+                    "group_id": group_id,
+                    "group_size": len(members),
+                    "member_position": position,
+                    "feature": member,
+                    "all_members": " | ".join(members),
+                }
+            )
+    return pd.DataFrame(
+        rows,
+        columns=["group_id", "group_size", "member_position", "feature", "all_members"],
+    )
+
+
+def _style_workbook(writer: pd.ExcelWriter) -> None:
+    workbook = writer.book
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    header_font = Font(color="FFFFFF", bold=True)
+    for sheet_name, worksheet in writer.sheets.items():
+        worksheet.freeze_panes = "B2" if sheet_name == "pearson_matrix" else "A2"
+        worksheet.auto_filter.ref = worksheet.dimensions
+        for cell in worksheet[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        for column_cells in worksheet.columns:
+            letter = column_cells[0].column_letter
+            maximum = max(
+                len(str(cell.value)) if cell.value is not None else 0
+                for cell in column_cells[: min(len(column_cells), 1000)]
+            )
+            worksheet.column_dimensions[letter].width = min(max(maximum + 2, 10), 45)
+    if "pearson_matrix" in writer.sheets:
+        worksheet = writer.sheets["pearson_matrix"]
+        if worksheet.max_row >= 2 and worksheet.max_column >= 2:
+            numeric_range = (
+                f"B2:{worksheet.cell(worksheet.max_row, worksheet.max_column).coordinate}"
+            )
+            worksheet.conditional_formatting.add(
+                numeric_range,
+                ColorScaleRule(
+                    start_type="num",
+                    start_value=-1,
+                    start_color="2C7BB6",
+                    mid_type="num",
+                    mid_value=0,
+                    mid_color="FFFFFF",
+                    end_type="num",
+                    end_value=1,
+                    end_color="D7191C",
+                ),
+            )
+
+
+def export_workbook(
+    correlation: pd.DataFrame,
+    pairs: pd.DataFrame,
+    groups: dict[str, list[str]],
+    target_results: dict[str, TargetResult],
+    destination: Path | str,
+    configuration: dict[str, Any],
+) -> Path:
+    path = Path(destination)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    config_table = pd.DataFrame(
+        {
+            "key": list(configuration.keys()),
+            "value": [
+                json.dumps(value, ensure_ascii=False, sort_keys=True)
+                if isinstance(value, (dict, list, tuple))
+                else value
+                for value in configuration.values()
+            ],
+        }
+    )
+    sheet_prefix = {"yield": "yield", "elongation": "elong"}
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        config_table.to_excel(writer, sheet_name="configuration", index=False)
+        correlation.to_excel(writer, sheet_name="pearson_matrix", index=True)
+        pairs.to_excel(writer, sheet_name="redundant_pairs", index=False)
+        _groups_table(groups).to_excel(
+            writer, sheet_name="redundancy_groups", index=False
+        )
+        for target_name, result in target_results.items():
+            prefix = sheet_prefix[target_name]
+            result.path.to_excel(writer, sheet_name=f"{prefix}_path", index=False)
+            result.candidate_metrics.to_excel(
+                writer, sheet_name=f"{prefix}_candidates", index=False
+            )
+            result.fold_metrics.to_excel(
+                writer, sheet_name=f"{prefix}_fold_metrics", index=False
+            )
+            result.seed_metrics.to_excel(
+                writer, sheet_name=f"{prefix}_seed_metrics", index=False
+            )
+            result.removals.to_excel(
+                writer, sheet_name=f"{prefix}_removals", index=False
+            )
+        _style_workbook(writer)
+    return path
+
+
+def print_console(message: str, stream: Any | None = None) -> None:
+    target = sys.stdout if stream is None else stream
+    encoding = getattr(target, "encoding", None) or "utf-8"
+    console_safe = str(message).encode(encoding, errors="backslashreplace").decode(encoding)
+    print(console_safe, file=target, flush=True)
+
+
+def print_json_summary(payload: dict[str, Any], stream: Any | None = None) -> None:
+    print_console(json.dumps(payload, ensure_ascii=False, indent=2), stream=stream)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data", type=Path, default=DATA_FILE)
+    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument(
+        "--target", choices=["both", "yield", "elongation"], default="both"
+    )
+    parser.add_argument("--max-rounds", type=int, default=None)
+    parser.add_argument("--jobs", type=int, default=DEFAULT_JOBS)
+    args = parser.parse_args()
+
+    source_frame, bundle = load_workbook_data(args.data)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    physical_frame = pd.DataFrame(
+        bundle.physical_matrix, columns=bundle.physical_names
+    )
+    correlation = physical_frame.corr(method="pearson")
+    groups, group_by_feature, pairs = build_redundancy_groups(
+        correlation, CORRELATION_THRESHOLD
+    )
+    plot_pearson_heatmap(correlation, output_dir)
+    correlation.to_csv(
+        output_dir / "物理特征_Pearson相关矩阵.csv", encoding="utf-8-sig"
+    )
+    pairs.to_csv(output_dir / "Pearson高相关特征对.csv", index=False, encoding="utf-8-sig")
+    _groups_table(groups).to_csv(
+        output_dir / "Pearson冗余特征组.csv", index=False, encoding="utf-8-sig"
+    )
+
+    targets = list(TARGET_NAMES) if args.target == "both" else [args.target]
+    label_by_target = {"yield": "强度", "elongation": "延伸率"}
+    results: dict[str, TargetResult] = {}
+    for target_name in targets:
+        target_output = output_dir / label_by_target[target_name]
+        result = run_target_selection(
+            bundle=bundle,
+            target_name=target_name,
+            correlation=correlation,
+            groups=groups,
+            group_by_feature=group_by_feature,
+            output_dir=target_output,
+            max_rounds=args.max_rounds,
+            jobs=args.jobs,
+        )
+        plot_selection_path(result.path, target_name, target_output)
+        results[target_name] = result
+
+    configuration = {
+        "data_file": str(args.data),
+        "sheet_name": SHEET_NAME,
+        "source_row_count": len(source_frame),
+        "base_feature_count": len(bundle.base_names),
+        "physical_feature_count": len(bundle.physical_names),
+        "yield_label_count": int(bundle.valid_masks["yield"].sum()),
+        "elongation_label_count": int(bundle.valid_masks["elongation"].sum()),
+        "correlation_threshold": CORRELATION_THRESHOLD,
+        "redundancy_group_count": len(groups),
+        "cv_seeds": list(CV_SEEDS),
+        "n_splits": N_SPLITS,
+        "cv_model_random_state": "seed * 100 + fold",
+        "fixed_lgbm_params": FIXED_LGBM_PARAMS,
+        "selection_metric": "mean_seed_level_five_fold_oof_rmse",
+        "selection_score_warning": "Feature path was selected on the same CV folds.",
+    }
+    workbook = export_workbook(
+        correlation=correlation,
+        pairs=pairs,
+        groups=groups,
+        target_results=results,
+        destination=output_dir / "LGBM物理特征Pearson动态前向筛选结果.xlsx",
+        configuration=configuration,
+    )
+    summary = {
+        "workbook": str(workbook),
+        "redundancy_groups": groups,
+        "targets": {
+            name: {
+                "selected_count": len(result.selected_features),
+                "remaining_count": len(result.remaining_features),
+                "minimum_oof_rmse": float(result.path["oof_rmse"].min()),
+                "minimum_round": int(
+                    result.path.loc[result.path["oof_rmse"].idxmin(), "round"]
+                ),
+            }
+            for name, result in results.items()
+        },
+    }
+    print_json_summary(summary)
+
+
+if __name__ == "__main__":
+    main()
