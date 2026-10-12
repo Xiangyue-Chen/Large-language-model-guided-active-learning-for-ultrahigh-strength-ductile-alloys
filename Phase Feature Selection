@@ -1,0 +1,428 @@
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import runpy
+import sys
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any
+
+import matplotlib
+
+matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+
+PROJECT_DIR = Path(__file__).resolve().parent
+PARENT_DIR = PROJECT_DIR.parent
+NAN_CORE_SCRIPT = (
+    PARENT_DIR / "LGBM-phase\u7279\u5f81\u7b5b\u9009-NaN\u7248" / "LGBM\u4e03\u7c7bPhase\u52a8\u6001\u524d\u5411\u7b5b\u9009.py"
+)
+MULTIHOT_CORE_SCRIPT = (
+    PARENT_DIR
+    / "LGBM-phase\u5f62\u8c8c\u591a\u70ed\u7b5b\u9009-NaN\u7248"
+    / "LGBM\u4e03\u7c7b\u76f8\u65cf\u5f62\u8c8c\u591a\u70ed\u7b5b\u9009.py"
+)
+PHASE_SPECIFIC_MORPHOLOGY_SCRIPT = PROJECT_DIR / "\u4e03\u7c7b\u76f8\u65cf\u4e13\u5c5e\u5f62\u8c8c\u591a\u70ed.py"
+JOINT_CORE_SCRIPT = (
+    PARENT_DIR
+    / "LGBM-phase33\u4e0e\u5f62\u8c8c\u5355\u5217\u8054\u5408\u7b5b\u9009-NaN\u7248"
+    / "LGBM\u4e03\u7c7bPhase33\u4e0e\u5f62\u8c8c\u5355\u5217\u8054\u5408\u7b5b\u9009.py"
+)
+PHASE_COLUMN = "phases"
+DEFAULT_JOBS = max(1, min(16, os.cpu_count() or 1))
+
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
+
+for required_script in (
+    NAN_CORE_SCRIPT,
+    MULTIHOT_CORE_SCRIPT,
+    PHASE_SPECIFIC_MORPHOLOGY_SCRIPT,
+    JOINT_CORE_SCRIPT,
+):
+    if not required_script.exists():
+        raise FileNotFoundError(required_script)
+
+NAN_CORE = runpy.run_path(str(NAN_CORE_SCRIPT))
+MULTIHOT_CORE = runpy.run_path(str(MULTIHOT_CORE_SCRIPT))
+PHASE_SPECIFIC_MORPHOLOGY = runpy.run_path(
+    str(PHASE_SPECIFIC_MORPHOLOGY_SCRIPT)
+)
+JOINT_CORE = runpy.run_path(str(JOINT_CORE_SCRIPT))
+
+DATA_FILE = Path(NAN_CORE["DATA_FILE"])
+CV_SEEDS = tuple(int(seed) for seed in NAN_CORE["CV_SEEDS"])
+N_SPLITS = int(NAN_CORE["N_SPLITS"])
+FIXED_LGBM_PARAMS = dict(NAN_CORE["FIXED_LGBM_PARAMS"])
+COMPACT_PHASE_FEATURE_NAMES = tuple(
+    name
+    for name in NAN_CORE["SOURCE_PHASE_FEATURE_NAMES"]
+    if "_lattice_mean_nm" not in name
+)
+SOURCE_MORPHOLOGY_FEATURE_NAMES = tuple(
+    PHASE_SPECIFIC_MORPHOLOGY["SOURCE_PHASE_SPECIFIC_MORPHOLOGY_NAMES"]
+)
+
+load_workbook_data = NAN_CORE["load_workbook_data"]
+load_physical_prefix = NAN_CORE["load_physical_prefix"]
+make_starting_matrix = NAN_CORE["make_starting_matrix"]
+style_workbook = NAN_CORE["style_workbook"]
+baseline_phase_feature_frame = NAN_CORE["build_phase_feature_frame"]
+build_family_morphology_multihot = PHASE_SPECIFIC_MORPHOLOGY[
+    "build_phase_specific_morphology_multihot"
+]
+select_morphology_candidates = MULTIHOT_CORE["select_morphology_candidates"]
+run_joint_selection = JOINT_CORE["run_joint_selection"]
+
+
+def build_phase_feature_frame(
+    values: Sequence[object] | pd.Series,
+) -> pd.DataFrame:
+    frame = baseline_phase_feature_frame(values).loc[
+        :, list(COMPACT_PHASE_FEATURE_NAMES)
+    ].copy()
+    return frame.astype(float)
+
+
+def combined_candidate_names(retained_morphology_names: Sequence[str]) -> list[str]:
+    return [
+        *map(str, COMPACT_PHASE_FEATURE_NAMES),
+        *map(str, retained_morphology_names),
+    ]
+
+
+def _candidate_route(name: str) -> str:
+    return "phase26" if name in COMPACT_PHASE_FEATURE_NAMES else "morphology_multi_hot"
+
+
+def _candidate_catalog(frame: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for order, name in enumerate(frame.columns.astype(str), start=1):
+        numeric = pd.to_numeric(frame[name], errors="coerce")
+        finite = np.isfinite(numeric)
+        rows.append(
+            {
+                "source_order": order,
+                "feature": name,
+                "route": _candidate_route(name),
+                "feature_type": "numeric",
+                "finite_count": int(finite.sum()),
+                "nan_count": int(numeric.isna().sum()),
+                "nonzero_count": int((finite & numeric.ne(0.0)).sum()),
+                "unique_count_without_nan": int(numeric.nunique(dropna=True)),
+                "minimum": float(numeric[finite].min()) if finite.any() else np.nan,
+                "maximum": float(numeric[finite].max()) if finite.any() else np.nan,
+                "selection_status": "retained_without_joint_pruning",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def select_source_morphology_vocabulary(
+    source_frame: pd.DataFrame,
+    min_positive_count: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    retained, catalog = select_morphology_candidates(
+        source_frame.reset_index(drop=True),
+        min_positive_count,
+    )
+    return retained, catalog
+
+
+def build_combined_candidates(
+    phase_values: pd.Series,
+    valid_mask: np.ndarray,
+    min_positive_count: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    compact_source = build_phase_feature_frame(phase_values).loc[
+        :, list(COMPACT_PHASE_FEATURE_NAMES)
+    ]
+    full_morphology_vocabulary = build_family_morphology_multihot(phase_values)
+    multihot_source, multihot_catalog = select_source_morphology_vocabulary(
+        full_morphology_vocabulary,
+        min_positive_count,
+    )
+    retained_morphology_names = multihot_source.columns.astype(str).tolist()
+    target_multihot = multihot_source.loc[valid_mask].reset_index(drop=True)
+    expected_names = combined_candidate_names(retained_morphology_names)
+
+    source = pd.concat(
+        [
+            compact_source.reset_index(drop=True),
+            multihot_source.reset_index(drop=True),
+        ],
+        axis=1,
+    )
+    target = pd.concat(
+        [
+            compact_source.loc[valid_mask].reset_index(drop=True),
+            target_multihot.reset_index(drop=True),
+        ],
+        axis=1,
+    )
+    if target.columns.astype(str).tolist() != expected_names:
+        raise RuntimeError("combined candidate order does not match Phase26 + multi-hot")
+    if len(set(expected_names)) != len(expected_names):
+        raise ValueError("Phase26 and morphology multi-hot candidates contain duplicates")
+    return source, target, _candidate_catalog(target), multihot_catalog
+
+
+def plot_path(path: pd.DataFrame, target_name: str, output_dir: Path) -> Path:
+    ordered = path.sort_values("phase_feature_count")
+    minimum = ordered.loc[ordered["oof_rmse"].idxmin()]
+    label = "Yield strength" if target_name == "yield" else "Elongation"
+    figure, axis = plt.subplots(figsize=(10.2, 6.8), constrained_layout=True)
+    axis.plot(
+        ordered["phase_feature_count"],
+        ordered["oof_rmse"],
+        marker="o",
+        linewidth=2,
+        color="#176B67",
+    )
+    axis.scatter(
+        [minimum["phase_feature_count"]],
+        [minimum["oof_rmse"]],
+        s=90,
+        color="#C0392B",
+        edgecolor="white",
+        linewidth=1.2,
+        zorder=4,
+        label="Minimum OOF RMSE",
+    )
+    maximum = int(ordered["phase_feature_count"].max())
+    axis.set_xticks(list(range(0, maximum + 1, 5)))
+    axis.set_xlabel("Selected joint Phase features")
+    axis.set_ylabel("Mean seed-level five-fold OOF RMSE")
+    axis.set_title(f"{label}: Phase26 and morphology multi-hot joint selection")
+    axis.grid(alpha=0.3)
+    axis.legend(frameon=False)
+    destination = output_dir / f"{target_name}_phase26_morphology_joint_rmse_path.png"
+    figure.savefig(destination, dpi=300, bbox_inches="tight", facecolor="white")
+    plt.close(figure)
+    return destination
+
+
+def export_workbook(
+    destination: Path,
+    configuration: dict[str, Any],
+    physical_prefix: Sequence[str],
+    catalog: pd.DataFrame,
+    multihot_catalog: pd.DataFrame,
+    source: pd.DataFrame,
+    result: dict[str, Any],
+) -> Path:
+    config = pd.DataFrame(
+        {
+            "key": list(configuration),
+            "value": [
+                json.dumps(value, ensure_ascii=False, sort_keys=True)
+                if isinstance(value, (dict, list, tuple))
+                else value
+                for value in configuration.values()
+            ],
+        }
+    )
+    with pd.ExcelWriter(destination, engine="openpyxl") as writer:
+        config.to_excel(writer, sheet_name="configuration", index=False)
+        pd.DataFrame(
+            {
+                "order": range(1, len(physical_prefix) + 1),
+                "physical_feature": physical_prefix,
+            }
+        ).to_excel(writer, sheet_name="physical_prefix", index=False)
+        catalog.to_excel(writer, sheet_name="candidate_catalog", index=False)
+        multihot_catalog.to_excel(writer, sheet_name="multihot_catalog", index=False)
+        source.to_excel(writer, sheet_name="source_matrix", index=False)
+        result["path"].to_excel(writer, sheet_name="selection_path", index=False)
+        result["candidate_metrics"].to_excel(
+            writer, sheet_name="candidate_metrics", index=False
+        )
+        result["fold_metrics"].to_excel(writer, sheet_name="fold_metrics", index=False)
+        result["seed_metrics"].to_excel(writer, sheet_name="seed_metrics", index=False)
+        result["stopping"].to_excel(
+            writer, sheet_name="stopping_decision", index=False
+        )
+        style_workbook(writer)
+    return destination
+
+
+def run(
+    data_path: Path,
+    target_name: str,
+    physical_selection_path: Path,
+    physical_count: int,
+    min_positive_count: int,
+    output_dir: Path,
+    jobs: int,
+    run_full_path: bool = True,
+    max_rounds: int | None = None,
+) -> dict[str, Any]:
+    source_frame, bundle = load_workbook_data(data_path)
+    if target_name not in {"yield", "elongation"}:
+        raise ValueError(f"unsupported target: {target_name}")
+    valid = np.asarray(bundle.valid_masks[target_name], dtype=bool)
+    physical_prefix, _ = load_physical_prefix(
+        physical_selection_path,
+        physical_count,
+        bundle.physical_names,
+    )
+    starting_matrix = make_starting_matrix(
+        bundle.base_matrix[valid],
+        bundle.physical_matrix[valid],
+        physical_prefix,
+        bundle.physical_names,
+    )
+    starting_names = [
+        *[f"base_{index:03d}" for index in range(len(bundle.base_names))],
+        *[f"physical_{index:03d}" for index in range(len(physical_prefix))],
+    ]
+    starting_frame = pd.DataFrame(starting_matrix, columns=starting_names)
+    source, target_candidates, catalog, multihot_catalog = build_combined_candidates(
+        source_frame[PHASE_COLUMN],
+        valid,
+        min_positive_count,
+    )
+    candidate_names = target_candidates.columns.astype(str).tolist()
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    source_export = source.copy()
+    source_export.insert(0, "original_excel_row", bundle.excel_rows)
+    source_export.insert(1, f"included_in_{target_name}", valid)
+    source_export.to_csv(
+        output_dir / "phase26_morphology_joint_source_matrix.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    catalog.to_csv(
+        output_dir / "joint_candidate_catalog.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    multihot_catalog.to_csv(
+        output_dir / "morphology_multihot_full_catalog.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    result = run_joint_selection(
+        starting_frame=starting_frame,
+        candidate_frame=target_candidates,
+        target=bundle.targets[target_name][valid],
+        target_name=target_name,
+        physical_prefix=physical_prefix,
+        output_dir=output_dir,
+        jobs=jobs,
+        minimum_rmse_improvement=0.0,
+        max_rounds=max_rounds,
+        run_full_path=run_full_path,
+        expected_candidate_names=candidate_names,
+        completion_reason="all_phase26_and_multihot_candidates_evaluated",
+    )
+    plot = plot_path(result["path"], target_name, output_dir)
+    configuration = {
+        "data_file": str(data_path),
+        "target": target_name,
+        "sample_count": int(valid.sum()),
+        "base_feature_count": len(bundle.base_names),
+        "physical_count": len(physical_prefix),
+        "starting_dimension": int(starting_frame.shape[1]),
+        "compact_phase_candidate_count": len(COMPACT_PHASE_FEATURE_NAMES),
+        "removed_lattice_candidate_count": 7,
+        "volume_completion_policy": "disabled",
+        "volume_missing_policy": (
+            "Absent family is 0; present family with no reported volume is NaN; "
+            "reported family values are preserved and summed without completion."
+        ),
+        "multihot_candidate_count": len(candidate_names)
+        - len(COMPACT_PHASE_FEATURE_NAMES),
+        "joint_candidate_count": len(candidate_names),
+        "minimum_positive_count_exclusive_for_phase_specific_morphology": int(min_positive_count),
+        "phase_specific_morphology_definition_count": len(SOURCE_MORPHOLOGY_FEATURE_NAMES),
+        "phase_specific_morphology_extracted_count": len(candidate_names)
+        - len(COMPACT_PHASE_FEATURE_NAMES),
+        "support_filter_scope": "full_workbook_before_target_mask",
+        "joint_redundancy_pruning": False,
+        "run_full_path": bool(run_full_path),
+        "cv_seeds": list(CV_SEEDS),
+        "n_splits": N_SPLITS,
+        "fixed_lgbm_params": FIXED_LGBM_PARAMS,
+        "selection_score_warning": (
+            "The same CV path selects and reports features; treat as exploratory."
+        ),
+    }
+    workbook = export_workbook(
+        output_dir / "phase26_morphology_joint_selection.xlsx",
+        configuration,
+        physical_prefix,
+        catalog,
+        multihot_catalog,
+        source_export,
+        result,
+    )
+    path = result["path"].sort_values("phase_feature_count")
+    baseline = path.iloc[0]
+    best = path.loc[path["oof_rmse"].idxmin()]
+    best_count = int(best["phase_feature_count"])
+    full_order = result["selected_features"]
+    summary = {
+        "target": target_name,
+        "starting_dimension": int(starting_frame.shape[1]),
+        "compact_phase_candidate_count": len(COMPACT_PHASE_FEATURE_NAMES),
+        "multihot_candidate_count": len(candidate_names)
+        - len(COMPACT_PHASE_FEATURE_NAMES),
+        "joint_candidate_count": len(candidate_names),
+        "volume_completion_policy": "disabled",
+        "baseline_oof_rmse": float(baseline["oof_rmse"]),
+        "baseline_oof_r2": float(baseline["oof_r2"]),
+        "best_prefix_feature_count": best_count,
+        "best_prefix_features": full_order[:best_count],
+        "best_oof_rmse": float(best["oof_rmse"]),
+        "best_oof_r2": float(best["oof_r2"]),
+        "full_path_feature_count": len(full_order),
+        "full_selection_order": full_order,
+        "stopping_decision": result["stopping"].to_dict(orient="records"),
+        "workbook": str(workbook.resolve()),
+        "plot": str(plot.resolve()),
+        "output_dir": str(output_dir.resolve()),
+    }
+    (output_dir / "run_summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return {"result": result, "catalog": catalog, "summary": summary}
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-path", type=Path, default=DATA_FILE)
+    parser.add_argument("--target", choices=["yield", "elongation"], required=True)
+    parser.add_argument("--physical-selection-path", type=Path, required=True)
+    parser.add_argument("--physical-count", type=int, required=True)
+    parser.add_argument("--min-positive-count", type=int, default=30)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--jobs", type=int, default=DEFAULT_JOBS)
+    parser.add_argument("--max-rounds", type=int)
+    parser.add_argument("--run-full-path", action="store_true")
+    args = parser.parse_args()
+    run(
+        data_path=args.data_path,
+        target_name=args.target,
+        physical_selection_path=args.physical_selection_path,
+        physical_count=args.physical_count,
+        min_positive_count=args.min_positive_count,
+        output_dir=args.output_dir,
+        jobs=args.jobs,
+        run_full_path=args.run_full_path,
+        max_rounds=args.max_rounds,
+    )
+
+
+if __name__ == "__main__":
+    main()
