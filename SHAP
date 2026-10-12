@@ -1,0 +1,1377 @@
+from __future__ import annotations
+
+import json
+import math
+import runpy
+from copy import copy
+from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Sequence
+
+import joblib
+import matplotlib
+import numpy as np
+import pandas as pd
+from matplotlib.colors import Normalize
+from matplotlib.ticker import MaxNLocator
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  
+
+
+PROJECT_DIR = Path(__file__).resolve().parent
+PARENT_DIR = PROJECT_DIR.parent
+JOINT_SELECTION_DIR = PARENT_DIR / "LGBM-phase33\u4e0e\u5f62\u8c8c\u591a\u70ed\u8054\u5408\u7b5b\u9009-NaN\u7248"
+JOINT_SELECTION_SCRIPT = JOINT_SELECTION_DIR / "LGBM\u4e03\u7c7bPhase33\u4e0e\u5f62\u8c8c\u591a\u70ed\u8054\u5408\u7b5b\u9009.py"
+PHYSICAL_SELECTION_DIR = PARENT_DIR / "LGBM-\u7269\u7406\u7279\u5f81\u7b5b\u9009"
+BEST_MODEL_DIR = PARENT_DIR / "LGBM-\u6700\u4f18\u6a21\u578b"
+CV_SEEDS = tuple(range(40, 50))
+N_SPLITS = 5
+MIN_POSITIVE_COUNT = 30
+VOLUME_FRACTION_PLOT_RANGE = (0.0, 100.0)
+PLOT_AXIS_LABEL_FONT_SIZE = 20
+PLOT_TICK_FONT_SIZE = 17
+PLOT_LEGEND_FONT_SIZE = 17
+GLOBAL_AXIS_LABEL_FONT_SIZE = 24
+GLOBAL_TICK_FONT_SIZE = 20
+GLOBAL_LEGEND_FONT_SIZE = 20
+
+plt.rcParams["font.sans-serif"] = [
+    "Microsoft YaHei",
+    "SimHei",
+    "Arial Unicode MS",
+    "DejaVu Sans",
+]
+plt.rcParams["axes.unicode_minus"] = False
+
+
+@dataclass(frozen=True)
+class TargetConfig:
+    target: str
+    physical_count: int
+    phase_count: int
+    physical_selection_path: Path
+    phase_selection_path: Path
+    output_dir: Path
+    model_source_dir: Path
+
+
+@dataclass
+class TargetDataset:
+    features: pd.DataFrame
+    target: np.ndarray
+    excel_rows: np.ndarray
+    manifest: pd.DataFrame
+    source_indices: np.ndarray
+
+
+@dataclass
+class OOFShapResult:
+    prediction: np.ndarray
+    prediction_std: np.ndarray
+    shap_values: np.ndarray
+    base_value: np.ndarray
+    coverage: np.ndarray
+    model_registry: pd.DataFrame
+    seed_metrics: pd.DataFrame
+    ensemble_metrics: dict[str, float]
+    mean_seed_metrics: dict[str, float]
+    max_additivity_error: float
+    seed_predictions: np.ndarray
+
+
+@dataclass
+class SavedEnsemblePrediction:
+    prediction: np.ndarray
+    prediction_std: np.ndarray
+    shap_values: np.ndarray
+    base_value: np.ndarray
+    max_additivity_error: float
+    model_count: int
+
+
+@dataclass
+class EnsembleContribution:
+    prediction: np.ndarray
+    shap_values: np.ndarray
+    base_value: np.ndarray
+    max_additivity_error: float
+
+
+@lru_cache(maxsize=1)
+def _pipeline_dependencies() -> dict[str, Any]:
+    if not JOINT_SELECTION_SCRIPT.exists():
+        raise FileNotFoundError(JOINT_SELECTION_SCRIPT)
+    namespace = runpy.run_path(str(JOINT_SELECTION_SCRIPT))
+    required = {
+        "DATA_FILE",
+        "load_workbook_data",
+        "load_physical_prefix",
+        "make_starting_matrix",
+        "build_combined_candidates",
+        "PHASE_COLUMN",
+    }
+    missing = required.difference(namespace)
+    if missing:
+        raise RuntimeError(f"joint selection module is missing interfaces: {sorted(missing)}")
+    return namespace
+
+
+def default_target_config(target: str) -> TargetConfig:
+    name = str(target)
+    if name == "yield":
+        return TargetConfig(
+            target=name,
+            physical_count=9,
+            phase_count=9,
+            physical_selection_path=(
+                PHYSICAL_SELECTION_DIR
+                / "\u7ed3\u679c_\u5f3a\u5ea6_\u9608\u503c0.95_10seed\u4e94\u6298"
+                / "\u5f3a\u5ea6"
+                / "selection_path.csv"
+            ),
+            phase_selection_path=(
+                JOINT_SELECTION_DIR
+                / "\u7ed3\u679c_\u5f3a\u5ea6_\u7269\u7406\u524d9\u4e2a_Phase26\u4e0e\u76f8\u65cf\u4e13\u5c5e\u5f62\u8c8c\u591a\u70ed_\u652f\u6301\u5927\u4e8e30_\u5b8c\u6574\u8def\u5f84"
+                / "selection_path.csv"
+            ),
+            output_dir=PROJECT_DIR / "yield_results",
+            model_source_dir=BEST_MODEL_DIR / "\u5f3a\u5ea6",
+        )
+    if name == "elongation":
+        return TargetConfig(
+            target=name,
+            physical_count=10,
+            phase_count=14,
+            physical_selection_path=(
+                PHYSICAL_SELECTION_DIR
+                / "\u7ed3\u679c_\u5ef6\u4f38\u7387_\u9608\u503c0.95_10seed\u4e94\u6298"
+                / "\u5ef6\u4f38\u7387"
+                / "selection_path.csv"
+            ),
+            phase_selection_path=(
+                JOINT_SELECTION_DIR
+                / "\u7ed3\u679c_\u5ef6\u4f38\u7387_\u7269\u7406\u524d10\u4e2a_Phase26\u4e0e\u76f8\u65cf\u4e13\u5c5e\u5f62\u8c8c\u591a\u70ed_\u652f\u6301\u5927\u4e8e30_\u5b8c\u6574\u8def\u5f84"
+                / "selection_path.csv"
+            ),
+            output_dir=PROJECT_DIR / "elongation_results",
+            model_source_dir=BEST_MODEL_DIR / "\u5ef6\u4f38\u7387",
+        )
+    raise ValueError(f"unsupported target: {target}")
+
+
+def load_selected_prefix(
+    path: Path | str,
+    count: int,
+    count_column: str = "round",
+) -> list[str]:
+    source = Path(path)
+    if not source.exists():
+        raise FileNotFoundError(source)
+    requested = int(count)
+    if requested < 0:
+        raise ValueError("selected prefix count must be non-negative")
+
+    table = pd.read_csv(source)
+    required = {count_column, "selected_feature"}
+    missing = required.difference(table.columns)
+    if missing:
+        raise KeyError(f"selection path is missing columns: {sorted(missing)}")
+    numeric_count = pd.to_numeric(table[count_column], errors="raise").astype(int)
+    table = table.assign(_selection_count=numeric_count)
+    rows = table.loc[
+        table["_selection_count"].between(1, requested, inclusive="both")
+    ].sort_values("_selection_count")
+    actual_counts = rows["_selection_count"].tolist()
+    expected_counts = list(range(1, requested + 1))
+    if actual_counts != expected_counts:
+        raise ValueError(
+            f"selection rounds must be contiguous from 1 to {requested}; "
+            f"got {actual_counts}"
+        )
+    names = rows["selected_feature"].astype(str).tolist()
+    if len(set(names)) != len(names):
+        raise ValueError("selected prefix contains duplicate feature names")
+    return names
+
+
+def build_feature_manifest(
+    base_names: Sequence[str],
+    physical_names: Sequence[str],
+    phase_names: Sequence[str],
+) -> pd.DataFrame:
+    base = [str(name) for name in base_names]
+    physical = [str(name) for name in physical_names]
+    phase = [str(name) for name in phase_names]
+    names = [*base, *physical, *phase]
+    if len(set(names)) != len(names):
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        raise ValueError(f"feature manifest contains duplicate names: {duplicates}")
+    routes = ["base"] * len(base) + ["physical"] * len(physical) + ["phase"] * len(phase)
+    return pd.DataFrame(
+        {
+            "position": np.arange(1, len(names) + 1, dtype=int),
+            "feature": names,
+            "model_feature": [f"feature_{index:03d}" for index in range(len(names))],
+            "route": routes,
+        }
+    )
+
+
+def build_target_dataset(config: TargetConfig) -> TargetDataset:
+    dependencies = _pipeline_dependencies()
+    source_frame, bundle = dependencies["load_workbook_data"](
+        Path(dependencies["DATA_FILE"])
+    )
+    if config.target not in {"yield", "elongation"}:
+        raise ValueError(f"unsupported target: {config.target}")
+    valid = np.asarray(bundle.valid_masks[config.target], dtype=bool)
+    source_indices = np.flatnonzero(valid)
+    physical_prefix, _ = dependencies["load_physical_prefix"](
+        config.physical_selection_path,
+        config.physical_count,
+        bundle.physical_names,
+    )
+    phase_prefix = load_selected_prefix(
+        config.phase_selection_path,
+        config.phase_count,
+        count_column="round",
+    )
+    starting_matrix = dependencies["make_starting_matrix"](
+        bundle.base_matrix[valid],
+        bundle.physical_matrix[valid],
+        physical_prefix,
+        bundle.physical_names,
+    )
+    phase_column = str(dependencies["PHASE_COLUMN"])
+    if phase_column not in source_frame.columns:
+        raise KeyError(f"source workbook is missing Phase column: {phase_column}")
+    _, target_candidates, _, _ = dependencies["build_combined_candidates"](
+        source_frame[phase_column],
+        valid,
+        MIN_POSITIVE_COUNT,
+    )
+    missing_phase = [name for name in phase_prefix if name not in target_candidates.columns]
+    if missing_phase:
+        raise KeyError(f"frozen Phase features are unavailable: {missing_phase}")
+    phase_matrix = target_candidates.loc[:, phase_prefix].to_numpy(dtype=float)
+    matrix = np.column_stack([starting_matrix, phase_matrix])
+    manifest = build_feature_manifest(
+        bundle.base_names,
+        physical_prefix,
+        phase_prefix,
+    )
+    expected_dimension = 47 if config.target == "yield" else 53
+    if matrix.shape[1] != expected_dimension:
+        raise ValueError(
+            f"{config.target} frozen feature dimension must be {expected_dimension}, "
+            f"got {matrix.shape[1]}"
+        )
+    if len(manifest) != matrix.shape[1]:
+        raise RuntimeError("feature manifest and matrix dimensions do not match")
+    feature_frame = pd.DataFrame(
+        matrix,
+        columns=manifest["feature"].astype(str).tolist(),
+    )
+    target = np.asarray(bundle.targets[config.target][valid], dtype=float)
+    if not np.isfinite(target).all():
+        raise ValueError("target contains non-finite values after validity filtering")
+    return TargetDataset(
+        features=feature_frame,
+        target=target,
+        excel_rows=np.asarray(bundle.excel_rows[valid], dtype=int),
+        manifest=manifest,
+        source_indices=source_indices.astype(int),
+    )
+
+
+def validate_oof_coverage(coverage: np.ndarray, expected: int) -> None:
+    values = np.asarray(coverage, dtype=int)
+    expected_count = int(expected)
+    invalid = np.flatnonzero(values != expected_count)
+    if invalid.size:
+        examples = invalid[:10].tolist()
+        raise ValueError(
+            f"OOF coverage must equal {expected_count} for every row; "
+            f"invalid row positions: {examples}"
+        )
+
+
+def _additivity_tolerance(prediction: np.ndarray) -> np.ndarray:
+    return 1e-8 * np.maximum(1.0, np.abs(np.asarray(prediction, dtype=float)))
+
+
+def aggregate_prediction_contributions(
+    predictions: np.ndarray,
+    contributions: np.ndarray,
+) -> EnsembleContribution:
+    prediction_matrix = np.asarray(predictions, dtype=float)
+    contribution_cube = np.asarray(contributions, dtype=float)
+    if prediction_matrix.ndim != 2:
+        raise ValueError("predictions must have shape (model_count, row_count)")
+    if contribution_cube.ndim != 3:
+        raise ValueError(
+            "contributions must have shape (model_count, row_count, feature_count + 1)"
+        )
+    if contribution_cube.shape[:2] != prediction_matrix.shape:
+        raise ValueError("prediction and contribution model/row dimensions must match")
+    if contribution_cube.shape[2] < 2:
+        raise ValueError("contributions must contain at least one feature and one base value")
+    if not np.isfinite(prediction_matrix).all() or not np.isfinite(contribution_cube).all():
+        raise ValueError("predictions and contributions must be finite")
+
+    reconstructed = contribution_cube.sum(axis=2)
+    model_errors = np.abs(prediction_matrix - reconstructed)
+    if np.any(model_errors > _additivity_tolerance(prediction_matrix)):
+        maximum = float(model_errors.max())
+        raise ValueError(f"model SHAP additivity check failed; maximum error={maximum:.6g}")
+
+    mean_prediction = prediction_matrix.mean(axis=0)
+    mean_shap = contribution_cube[:, :, :-1].mean(axis=0)
+    mean_base = contribution_cube[:, :, -1].mean(axis=0)
+    ensemble_error = np.abs(mean_prediction - (mean_base + mean_shap.sum(axis=1)))
+    maximum_error = float(ensemble_error.max(initial=0.0))
+    if np.any(ensemble_error > _additivity_tolerance(mean_prediction)):
+        raise ValueError(
+            f"ensemble SHAP additivity check failed; maximum error={maximum_error:.6g}"
+        )
+    return EnsembleContribution(
+        prediction=mean_prediction,
+        shap_values=mean_shap,
+        base_value=mean_base,
+        max_additivity_error=maximum_error,
+    )
+
+
+def validate_prediction_schema(
+    frame: pd.DataFrame,
+    feature_names: Sequence[str],
+) -> pd.DataFrame:
+    required = [str(name) for name in feature_names]
+    if len(set(required)) != len(required):
+        raise ValueError("prediction feature manifest contains duplicate names")
+    missing = [name for name in required if name not in frame.columns]
+    if missing:
+        raise KeyError(f"prediction input is missing required features: {missing}")
+    original = frame.loc[:, required]
+    selected = original.apply(pd.to_numeric, errors="coerce")
+    invalid = original.notna() & selected.isna()
+    for column in required:
+        invalid[column] &= original[column].astype(str).str.strip().ne("")
+    if invalid.to_numpy().any():
+        row_index, column_index = np.argwhere(invalid.to_numpy())[0]
+        raise ValueError(
+            "prediction input contains a non-numeric feature value at "
+            f"row={original.index[row_index]}, feature={required[column_index]}"
+        )
+    return selected.astype(float)
+
+
+def expected_output_names() -> set[str]:
+    return {
+        "shap_analysis.xlsx",
+        "shap_global_importance_bar.png",
+        "shap_global_beeswarm.png",
+        "shap_feature_dependence.png",
+        "oof_measured_vs_predicted.png",
+        "run_summary.json",
+        "feature_manifest.csv",
+        "feature_manifest.json",
+        "model_registry.csv",
+        "plot_range_audit.csv",
+    }
+
+
+def regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
+    true = np.asarray(y_true, dtype=float)
+    predicted = np.asarray(y_pred, dtype=float)
+    return {
+        "r2": float(r2_score(true, predicted)),
+        "mae": float(mean_absolute_error(true, predicted)),
+        "rmse": float(math.sqrt(mean_squared_error(true, predicted))),
+    }
+
+
+def _resolve_registered_model_path(raw_path: object, source_dir: Path) -> Path:
+    model_path = Path(str(raw_path))
+    if model_path.exists():
+        return model_path.resolve()
+    fallback = source_dir / "models" / model_path.name
+    if fallback.exists():
+        return fallback.resolve()
+    raise FileNotFoundError(model_path)
+
+
+def _validate_saved_artifact_schema(
+    artifact: dict[str, Any],
+    dataset: TargetDataset,
+    config: TargetConfig,
+    seed: int,
+    fold: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    required = {
+        "model",
+        "target",
+        "seed",
+        "fold",
+        "feature_names",
+        "model_feature_names",
+        "feature_manifest",
+        "train_indices",
+        "test_indices",
+        "train_excel_rows",
+        "test_excel_rows",
+    }
+    missing = required.difference(artifact)
+    if missing:
+        raise KeyError(f"saved model artifact is missing keys: {sorted(missing)}")
+    if str(artifact["target"]) != config.target:
+        raise ValueError("saved model target does not match requested target")
+    if int(artifact["seed"]) != seed or int(artifact["fold"]) != fold:
+        raise ValueError("saved model seed/fold does not match model registry")
+
+    feature_names = dataset.manifest["feature"].astype(str).tolist()
+    model_names = dataset.manifest["model_feature"].astype(str).tolist()
+    if [str(value) for value in artifact["feature_names"]] != feature_names:
+        raise ValueError("saved model feature order does not match frozen manifest")
+    if [str(value) for value in artifact["model_feature_names"]] != model_names:
+        raise ValueError("saved model internal feature order does not match frozen manifest")
+    artifact_manifest = pd.DataFrame(artifact["feature_manifest"])
+    manifest_columns = ["position", "feature", "model_feature", "route"]
+    if any(column not in artifact_manifest.columns for column in manifest_columns):
+        raise ValueError("saved model feature manifest is incomplete")
+    left = artifact_manifest.loc[:, manifest_columns].reset_index(drop=True).astype(str)
+    right = dataset.manifest.loc[:, manifest_columns].reset_index(drop=True).astype(str)
+    if not left.equals(right):
+        raise ValueError("saved model feature manifest does not match current dataset")
+
+    sample_count = len(dataset.target)
+    train_indices = np.asarray(artifact["train_indices"], dtype=int)
+    test_indices = np.asarray(artifact["test_indices"], dtype=int)
+    for name, indices in (("train", train_indices), ("test", test_indices)):
+        if indices.ndim != 1 or len(np.unique(indices)) != len(indices):
+            raise ValueError(f"saved model {name} indices must be one-dimensional and unique")
+        if indices.size == 0 or indices.min() < 0 or indices.max() >= sample_count:
+            raise ValueError(f"saved model {name} indices are outside the dataset")
+    if np.intersect1d(train_indices, test_indices).size:
+        raise ValueError("saved model train and test indices overlap")
+    if len(train_indices) + len(test_indices) != sample_count:
+        raise ValueError("saved model train/test indices do not cover the dataset")
+    if not np.array_equal(
+        np.sort(np.concatenate([train_indices, test_indices])),
+        np.arange(sample_count, dtype=int),
+    ):
+        raise ValueError("saved model train/test indices are not a full partition")
+    if not np.array_equal(
+        np.asarray(artifact["train_excel_rows"], dtype=int),
+        np.asarray(dataset.excel_rows[train_indices], dtype=int),
+    ):
+        raise ValueError("saved model training Excel rows do not match the dataset")
+    if not np.array_equal(
+        np.asarray(artifact["test_excel_rows"], dtype=int),
+        np.asarray(dataset.excel_rows[test_indices], dtype=int),
+    ):
+        raise ValueError("saved model test Excel rows do not match the dataset")
+    return train_indices, test_indices
+
+
+def load_oof_shap_from_saved_models(
+    dataset: TargetDataset,
+    config: TargetConfig,
+    expected_seeds: Sequence[int] = CV_SEEDS,
+    expected_n_splits: int = N_SPLITS,
+) -> OOFShapResult:
+    seed_order = tuple(int(seed) for seed in expected_seeds)
+    if not seed_order or len(set(seed_order)) != len(seed_order):
+        raise ValueError("expected seeds must be non-empty and unique")
+    fold_count = int(expected_n_splits)
+    if fold_count < 2:
+        raise ValueError("expected_n_splits must be at least 2")
+    features = dataset.features.copy()
+    target = np.asarray(dataset.target, dtype=float)
+    if len(features) != len(target):
+        raise ValueError("feature and target row counts differ")
+    if len(dataset.manifest) != features.shape[1]:
+        raise ValueError("feature manifest does not match feature matrix width")
+    expected_names = dataset.manifest["feature"].astype(str).tolist()
+    if features.columns.astype(str).tolist() != expected_names:
+        raise ValueError("feature matrix columns do not match the manifest order")
+
+    model_names = dataset.manifest["model_feature"].astype(str).tolist()
+    model_frame = features.copy()
+    model_frame.columns = model_names
+    sample_count, feature_count = model_frame.shape
+    source_dir = Path(config.model_source_dir)
+    registry_path = source_dir / "model_registry.csv"
+    if not registry_path.exists():
+        raise FileNotFoundError(registry_path)
+    source_registry = pd.read_csv(registry_path)
+    required_registry = {"target", "seed", "fold", "model_path"}
+    missing_registry = required_registry.difference(source_registry.columns)
+    if missing_registry:
+        raise KeyError(f"model registry is missing columns: {sorted(missing_registry)}")
+    if source_registry.empty:
+        raise ValueError("model registry is empty")
+    source_registry["seed"] = pd.to_numeric(source_registry["seed"], errors="raise").astype(int)
+    source_registry["fold"] = pd.to_numeric(source_registry["fold"], errors="raise").astype(int)
+    if source_registry.duplicated(["seed", "fold"]).any():
+        raise ValueError("model registry contains duplicate seed/fold records")
+    expected_pairs = {
+        (seed, fold)
+        for seed in seed_order
+        for fold in range(1, fold_count + 1)
+    }
+    actual_pairs = set(zip(source_registry["seed"], source_registry["fold"]))
+    if actual_pairs != expected_pairs:
+        missing_pairs = sorted(expected_pairs.difference(actual_pairs))
+        unexpected_pairs = sorted(actual_pairs.difference(expected_pairs))
+        raise ValueError(
+            "model registry seed/fold coverage mismatch; "
+            f"missing={missing_pairs}, unexpected={unexpected_pairs}"
+        )
+    if not source_registry["target"].astype(str).eq(config.target).all():
+        raise ValueError("model registry contains a different target")
+    source_registry = source_registry.sort_values(["seed", "fold"]).reset_index(drop=True)
+
+    prediction_sum = np.zeros(sample_count, dtype=float)
+    prediction_square_sum = np.zeros(sample_count, dtype=float)
+    shap_sum = np.zeros((sample_count, feature_count), dtype=float)
+    base_sum = np.zeros(sample_count, dtype=float)
+    coverage = np.zeros(sample_count, dtype=int)
+    seed_predictions = np.full((len(seed_order), sample_count), np.nan, dtype=float)
+    registry_rows: list[dict[str, Any]] = []
+    seed_index_by_value = {seed: index for index, seed in enumerate(seed_order)}
+
+    for _, registry_row in source_registry.iterrows():
+        seed = int(registry_row["seed"])
+        fold = int(registry_row["fold"])
+        seed_index = seed_index_by_value[seed]
+        model_path = _resolve_registered_model_path(
+            registry_row["model_path"], source_dir
+        )
+        artifact = joblib.load(model_path)
+        if not isinstance(artifact, dict):
+            raise TypeError(f"saved model artifact must be a dictionary: {model_path}")
+        train_indices, test_indices = _validate_saved_artifact_schema(
+            artifact, dataset, config, seed, fold
+        )
+        model = artifact["model"]
+        test_frame = model_frame.iloc[test_indices]
+        prediction = np.asarray(model.predict(test_frame), dtype=float)
+        contribution = np.asarray(
+            model.predict(test_frame, pred_contrib=True),
+            dtype=float,
+        )
+        if prediction.shape != (len(test_indices),):
+            raise RuntimeError("saved model prediction shape does not match test rows")
+        if contribution.shape != (len(test_indices), feature_count + 1):
+            raise RuntimeError(
+                "native TreeSHAP contribution shape does not match feature count"
+            )
+        fold_contribution = aggregate_prediction_contributions(
+            prediction[None, :],
+            contribution[None, :, :],
+        )
+        seed_predictions[seed_index, test_indices] = prediction
+        prediction_sum[test_indices] += prediction
+        prediction_square_sum[test_indices] += prediction**2
+        shap_sum[test_indices] += contribution[:, :-1]
+        base_sum[test_indices] += contribution[:, -1]
+        coverage[test_indices] += 1
+
+        fold_metrics = regression_metrics(target[test_indices], prediction)
+        registry_record = registry_row.to_dict()
+        registry_record.update(
+            {
+                "model_path": str(model_path),
+                "source_model_path": str(model_path),
+                "train_count": int(len(train_indices)),
+                "test_count": int(len(test_indices)),
+                "loaded_test_r2": fold_metrics["r2"],
+                "loaded_test_mae": fold_metrics["mae"],
+                "loaded_test_rmse": fold_metrics["rmse"],
+                "max_additivity_error": fold_contribution.max_additivity_error,
+            }
+        )
+        registry_rows.append(registry_record)
+
+    seed_rows: list[dict[str, Any]] = []
+    for seed_index, seed in enumerate(seed_order):
+        if not np.isfinite(seed_predictions[seed_index]).all():
+            raise RuntimeError(f"seed {seed} does not provide exactly one OOF prediction per row")
+        seed_rows.append(
+            {
+                "target": config.target,
+                "seed": int(seed),
+                **regression_metrics(target, seed_predictions[seed_index]),
+            }
+        )
+
+    validate_oof_coverage(coverage, expected=len(seed_order))
+    prediction = prediction_sum / coverage
+    prediction_variance = np.maximum(
+        prediction_square_sum / coverage - prediction**2,
+        0.0,
+    )
+    prediction_std = np.sqrt(prediction_variance)
+    shap_values = shap_sum / coverage[:, None]
+    base_value = base_sum / coverage
+    additivity_error = np.abs(prediction - (base_value + shap_values.sum(axis=1)))
+    maximum_error = float(additivity_error.max(initial=0.0))
+    if np.any(additivity_error > _additivity_tolerance(prediction)):
+        raise RuntimeError(
+            f"OOF ensemble SHAP additivity failed; maximum error={maximum_error:.6g}"
+        )
+    seed_metrics = pd.DataFrame(seed_rows)
+    mean_seed_metrics = {
+        f"mean_seed_{metric}": float(seed_metrics[metric].mean())
+        for metric in ("r2", "mae", "rmse")
+    }
+    mean_seed_metrics.update(
+        {
+            f"std_seed_{metric}": float(seed_metrics[metric].std(ddof=0))
+            for metric in ("r2", "mae", "rmse")
+        }
+    )
+    return OOFShapResult(
+        prediction=prediction,
+        prediction_std=prediction_std,
+        shap_values=shap_values,
+        base_value=base_value,
+        coverage=coverage,
+        model_registry=pd.DataFrame(registry_rows),
+        seed_metrics=seed_metrics,
+        ensemble_metrics=regression_metrics(target, prediction),
+        mean_seed_metrics=mean_seed_metrics,
+        max_additivity_error=maximum_error,
+        seed_predictions=seed_predictions,
+    )
+
+
+def _target_label(target: str) -> tuple[str, str]:
+    if target == "yield":
+        return "Yield strength", "MPa"
+    if target == "elongation":
+        return "Elongation", "%"
+    return str(target), ""
+
+
+_PLOT_SUBSCRIPT_REPLACEMENTS = str.maketrans(
+    {
+        "₀": "_0",
+        "₁": "_1",
+        "₂": "_2",
+        "₃": "_3",
+        "₄": "_4",
+        "₅": "_5",
+        "₆": "_6",
+        "₇": "_7",
+        "₈": "_8",
+        "₉": "_9",
+        "ₐ": "_a",
+        "ₑ": "_e",
+        "ₕ": "_h",
+        "ᵢ": "_i",
+        "ⱼ": "_j",
+        "ₖ": "_k",
+        "ₗ": "_l",
+        "ₘ": "_m",
+        "ₙ": "_n",
+        "ₒ": "_o",
+        "ₚ": "_p",
+        "ᵣ": "_r",
+        "ₛ": "_s",
+        "ₜ": "_t",
+        "ᵤ": "_u",
+        "ᵥ": "_v",
+        "ₓ": "_x",
+    }
+)
+
+
+PHASE_DISPLAY_ALIASES = {
+    "phase_BCC_morph_matrix": "BCC_matrix",
+    "phase_family_count": "phase_count",
+    "phase_FCC_morph_lamellar_lath_cellular": "FCC_lamellar",
+    "phase_FCC_morph_dendritic": "FCC_dendritic",
+    "phase_has_FCC": "has_FCC",
+    "phase_L12_volume_pct": "L12_volume",
+    "phase_OTHER_INTERMETALLIC_item_count": "Other_Intermatellic_count",
+    "phase_B2_size_mean_nm": "B2_size",
+    "phase_FCC_morph_elongated_columnar_fibrous_needle_rod": "FCC_columnar",
+    "phase_has_B2": "has_B2",
+    "phase_has_L12": "has_L12",
+    "phase_has_OTHER_INTERMETALLIC": "has_Other_Intermatellic",
+    "phase_CARBIDE_morph_particle_spherical_blocky_discrete": "Carbide_spherical",
+    "phase_OTHER_INTERMETALLIC_morph_plate_needle_rod": "Other_Intermatellic_needle",
+    "phase_L12_morph_plate_needle_rod": "L12_needle",
+    "phase_coexist_FCC_L12": "coexist_FCC_L12",
+    "phase_BCC_morph_elongated_columnar_fibrous_needle_rod": "BCC_columnar",
+    "phase_B2_morph_matrix_continuous_bulk_ordered": "B2_matrix",
+    "phase_BCC_morph_particle_blocky_island_network": "BCC particle",
+    "phase_B2_morph_lamellar_lath_cellular": "B2_lamellar",
+    "phase_L12_morph_particle_spherical_cuboidal_blocky": "L12_spherical",
+    "phase_has_BCC": "has_BCC",
+    "phase_has_CARBIDE": "has_Carbide",
+    "phase_FCC_morph_particle_blocky_island_network": "FCC_particle",
+    "phase_BCC_size_mean_nm": "BCC_size",
+    "phase_BCC_morph_dendritic": "BCC_dendritic",
+    "phase_coexist_FCC_BCC": "coexist_FCC_BCC",
+    "phase_OTHER_INTERMETALLIC_morph_lamellar_cellular_network": "Other_Intermatellic_lamellar",
+    "phase_OTHER_INTERMETALLIC_morph_particle_spherical_blocky_discrete": "Other_Intermatellic_spherical",
+    "phase_OTHER_INTERMETALLIC_size_mean_nm": "Other_Intermatellic_size",
+    "phase_B2_volume_pct": "B2_volume",
+    "phase_B2_morph_plate_needle_rod": "B2_needle",
+    "phase_has_HCP": "has_HCP",
+    "phase_BCC_morph_lamellar_lath_cellular": "BCC_lamellar",
+    "phase_coexist_BCC_B2": "coexist_BCC_B2",
+    "phase_HCP_size_mean_nm": "HCP_size",
+    "phase_FCC_morph_matrix": "FCC_matrix",
+    "phase_BCC_morph_equiaxed": "BCC_equiaxed",
+    "phase_B2_morph_ordered_domain_network": "B2_network",
+    "phase_HCP_morph_plate_lath_lamellar_needle_rod": "HCP_plate",
+    "phase_B2_morph_particle_spherical_cuboidal_blocky": "B2_spherical",
+    "phase_CARBIDE_volume_pct": "Carbide_volume",
+    "phase_CARBIDE_size_mean_nm": "Carbide_size",
+    "phase_L12_morph_lamellar_lath_cellular": "L12_lamellar",
+    "phase_BCC_volume_pct": "BCC_volume",
+    "phase_FCC_morph_equiaxed": "FCC_equiaxed",
+    "phase_FCC_size_mean_nm": "FCC_size",
+    "phase_OTHER_INTERMETALLIC_volume_pct": "Other_Intermatellic_volume",
+    "phase_L12_size_mean_nm": "L12_size",
+    "phase_HCP_volume_pct": "HCP_volume",
+    "phase_FCC_volume_pct": "FCC_volume",
+}
+
+
+def display_feature_label(name: str) -> str:
+    internal_name = str(name)
+    display_name = PHASE_DISPLAY_ALIASES.get(internal_name, internal_name)
+    return display_name.translate(_PLOT_SUBSCRIPT_REPLACEMENTS)
+
+
+def _plot_range_for_feature(feature: str) -> tuple[float, float] | None:
+    name = str(feature)
+    if name.startswith("phase_") and name.endswith("_volume_pct"):
+        return VOLUME_FRACTION_PLOT_RANGE
+    return None
+
+
+def plot_range_masks(
+    feature: str,
+    values: np.ndarray | Sequence[float],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    numeric = np.asarray(values, dtype=float)
+    finite = np.isfinite(numeric)
+    allowed_range = _plot_range_for_feature(feature)
+    excluded = np.zeros(numeric.shape, dtype=bool)
+    if allowed_range is not None:
+        lower, upper = allowed_range
+        excluded = finite & ((numeric < lower) | (numeric > upper))
+    return finite & ~excluded, ~finite, excluded
+
+
+def build_plot_range_audit(dataset: TargetDataset) -> pd.DataFrame:
+    columns = [
+        "source_index_zero_based",
+        "original_excel_row",
+        "feature",
+        "value",
+        "allowed_min",
+        "allowed_max",
+        "reason",
+    ]
+    rows: list[dict[str, Any]] = []
+    for feature in dataset.manifest["feature"].astype(str):
+        allowed_range = _plot_range_for_feature(feature)
+        if allowed_range is None:
+            continue
+        values = dataset.features[feature].to_numpy(dtype=float)
+        _, _, excluded = plot_range_masks(feature, values)
+        lower, upper = allowed_range
+        for row_index in np.flatnonzero(excluded):
+            rows.append(
+                {
+                    "source_index_zero_based": int(dataset.source_indices[row_index]),
+                    "original_excel_row": int(dataset.excel_rows[row_index]),
+                    "feature": feature,
+                    "value": float(values[row_index]),
+                    "allowed_min": float(lower),
+                    "allowed_max": float(upper),
+                    "reason": "outside_plot_range",
+                }
+            )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def build_global_importance(
+    result: OOFShapResult,
+    dataset: TargetDataset,
+) -> pd.DataFrame:
+    absolute = np.abs(result.shap_values)
+    values = dataset.features.to_numpy(dtype=float)
+    table = dataset.manifest.copy()
+    table["mean_abs_shap"] = absolute.mean(axis=0)
+    table["std_abs_shap"] = absolute.std(axis=0, ddof=0)
+    table["mean_shap"] = result.shap_values.mean(axis=0)
+    table["finite_value_count"] = np.isfinite(values).sum(axis=0)
+    table["missing_value_count"] = np.isnan(values).sum(axis=0)
+    table["nonzero_value_count"] = (
+        np.isfinite(values) & ~np.isclose(values, 0.0)
+    ).sum(axis=0)
+    table = table.sort_values("mean_abs_shap", ascending=False).reset_index(drop=True)
+    table.insert(0, "importance_rank", np.arange(1, len(table) + 1, dtype=int))
+    return table
+
+
+def _apply_paper_axis_style(
+    axis: plt.Axes,
+    *,
+    label_font_size: int = PLOT_AXIS_LABEL_FONT_SIZE,
+    tick_font_size: int = PLOT_TICK_FONT_SIZE,
+) -> None:
+    axis.xaxis.label.set_fontsize(label_font_size)
+    axis.xaxis.label.set_fontweight("bold")
+    axis.yaxis.label.set_fontsize(label_font_size)
+    axis.yaxis.label.set_fontweight("bold")
+    axis.tick_params(
+        axis="both",
+        which="both",
+        direction="in",
+        labelsize=tick_font_size,
+        length=5,
+        width=1.0,
+    )
+    for tick_label in [*axis.get_xticklabels(), *axis.get_yticklabels()]:
+        tick_label.set_fontweight("bold")
+    axis.grid(False)
+
+
+def _nice_endpoint_ticks(
+    values: np.ndarray,
+    *,
+    include_zero: bool = False,
+    max_intervals: int = 5,
+) -> np.ndarray:
+    finite = np.asarray(values, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if not finite.size:
+        return np.array([], dtype=float)
+    data_lower = float(finite.min())
+    data_upper = float(finite.max())
+    lower = min(data_lower, 0.0) if include_zero else data_lower
+    upper = max(data_upper, 0.0) if include_zero else data_upper
+    span = upper - lower
+    padding = 0.03 * span if span > 0.0 else max(abs(lower) * 0.05, 1.0)
+    padded_lower = lower - padding
+    padded_upper = upper + padding
+    locator = MaxNLocator(nbins=max_intervals, min_n_ticks=3)
+    ticks = np.asarray(locator.tick_values(padded_lower, padded_upper), dtype=float)
+    if data_lower >= 0.0:
+        nonnegative = ticks[ticks >= 0.0]
+        if nonnegative.size >= 2 and nonnegative[0] <= data_lower:
+            ticks = nonnegative
+    return ticks
+
+
+def _set_dependence_endpoint_ticks(
+    axis: plt.Axes,
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+) -> None:
+    x_ticks = _nice_endpoint_ticks(x_values)
+    y_ticks = _nice_endpoint_ticks(y_values, include_zero=True)
+    if x_ticks.size >= 2:
+        axis.set_xlim(float(x_ticks[0]), float(x_ticks[-1]))
+        axis.set_xticks(x_ticks)
+    if y_ticks.size >= 2:
+        axis.set_ylim(float(y_ticks[0]), float(y_ticks[-1]))
+        axis.set_yticks(y_ticks)
+
+
+def _plot_global_bar(
+    importance: pd.DataFrame,
+    target: str,
+    destination: Path,
+    top_n: int = 20,
+) -> None:
+    selected = importance.head(min(top_n, len(importance))).iloc[::-1]
+    colors = selected["route"].map(
+        {"base": "#3B6FB6", "physical": "#168A78", "phase": "#D75A4A"}
+    ).fillna("#777777")
+    figure, axis = plt.subplots(figsize=(12.5, 10.2), constrained_layout=True)
+    axis.barh(
+        selected["feature"].map(display_feature_label),
+        selected["mean_abs_shap"],
+        color=colors,
+    )
+    _, unit = _target_label(target)
+    axis.set_xlabel(
+        f"Mean SHAP importance ({unit})" if unit else "Mean SHAP importance"
+    )
+    _apply_paper_axis_style(
+        axis,
+        label_font_size=GLOBAL_AXIS_LABEL_FONT_SIZE,
+        tick_font_size=GLOBAL_TICK_FONT_SIZE,
+    )
+    route_handles = [
+        plt.Line2D([0], [0], marker="s", linestyle="", color=color, label=route)
+        for route, color in (
+            ("Base", "#3B6FB6"),
+            ("Physical", "#168A78"),
+            ("Phase", "#D75A4A"),
+        )
+    ]
+    axis.legend(
+        handles=route_handles,
+        loc="lower right",
+        frameon=False,
+        prop={"size": GLOBAL_LEGEND_FONT_SIZE, "weight": "bold"},
+    )
+    figure.savefig(destination, dpi=300, bbox_inches="tight")
+    plt.close(figure)
+
+
+def _normalized_feature_colors(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    numeric = np.asarray(values, dtype=float)
+    finite = np.isfinite(numeric)
+    colors = np.full(len(numeric), 0.5, dtype=float)
+    if finite.any():
+        lower, upper = np.nanpercentile(numeric[finite], [5, 95])
+        if upper > lower:
+            colors[finite] = np.clip((numeric[finite] - lower) / (upper - lower), 0.0, 1.0)
+        else:
+            colors[finite] = 0.5
+    return colors, finite
+
+
+def _plot_beeswarm(
+    result: OOFShapResult,
+    dataset: TargetDataset,
+    importance: pd.DataFrame,
+    target: str,
+    destination: Path,
+    top_n: int = 20,
+) -> None:
+    selected = importance.head(min(top_n, len(importance)))
+    feature_to_index = {
+        name: index for index, name in enumerate(dataset.manifest["feature"].astype(str))
+    }
+    rng = np.random.default_rng(42)
+    figure, axis = plt.subplots(figsize=(13.8, 11.2), constrained_layout=True)
+    for y_position, feature in enumerate(selected["feature"].iloc[::-1]):
+        index = feature_to_index[str(feature)]
+        shap_values = result.shap_values[:, index]
+        values = dataset.features.iloc[:, index].to_numpy(dtype=float)
+        colors, _ = _normalized_feature_colors(values)
+        finite_valid, missing, _ = plot_range_masks(str(feature), values)
+        jitter = rng.normal(0.0, 0.105, size=len(shap_values))
+        axis.scatter(
+            shap_values[finite_valid],
+            y_position + jitter[finite_valid],
+            c=colors[finite_valid],
+            cmap="coolwarm",
+            vmin=0.0,
+            vmax=1.0,
+            s=9,
+            alpha=0.55,
+            linewidths=0,
+            rasterized=True,
+        )
+        if missing.any():
+            axis.scatter(
+                shap_values[missing],
+                y_position + jitter[missing],
+                color="#8C8C8C",
+                s=9,
+                alpha=0.45,
+                linewidths=0,
+                rasterized=True,
+            )
+    axis.axvline(0.0, color="#333333", linewidth=1.0, alpha=0.7)
+    axis.set_yticks(range(len(selected)))
+    axis.set_yticklabels(
+        selected["feature"].iloc[::-1].map(display_feature_label)
+    )
+    _, unit = _target_label(target)
+    axis.set_xlabel(f"SHAP value ({unit})" if unit else "SHAP value")
+    _apply_paper_axis_style(
+        axis,
+        label_font_size=GLOBAL_AXIS_LABEL_FONT_SIZE,
+        tick_font_size=GLOBAL_TICK_FONT_SIZE,
+    )
+    scalar = plt.cm.ScalarMappable(cmap="coolwarm", norm=Normalize(0.0, 1.0))
+    colorbar = figure.colorbar(scalar, ax=axis, pad=0.015, aspect=35)
+    colorbar.set_ticks([0.0, 1.0])
+    colorbar.set_ticklabels(["Low", "High"])
+    colorbar.set_label(
+        "Feature value",
+        fontsize=GLOBAL_AXIS_LABEL_FONT_SIZE,
+        fontweight="bold",
+    )
+    colorbar.ax.tick_params(
+        axis="y",
+        which="both",
+        direction="in",
+        labelsize=GLOBAL_TICK_FONT_SIZE,
+        length=5,
+        width=1.0,
+    )
+    for tick_label in colorbar.ax.get_yticklabels():
+        tick_label.set_fontweight("bold")
+    figure.savefig(destination, dpi=300, bbox_inches="tight")
+    plt.close(figure)
+
+
+def _plot_dependence_panels(
+    result: OOFShapResult,
+    dataset: TargetDataset,
+    importance: pd.DataFrame,
+    target: str,
+    destination: Path,
+    panel_count: int = 6,
+) -> None:
+    selected = importance.head(min(panel_count, len(importance)))
+    feature_to_index = {
+        name: index for index, name in enumerate(dataset.manifest["feature"].astype(str))
+    }
+    figure, axes = plt.subplots(2, 3, figsize=(16.5, 9.8), constrained_layout=True)
+    flat_axes = axes.ravel()
+    for axis, feature in zip(flat_axes, selected["feature"], strict=False):
+        index = feature_to_index[str(feature)]
+        values = dataset.features.iloc[:, index].to_numpy(dtype=float)
+        shap_values = result.shap_values[:, index]
+        finite_valid, _, _ = plot_range_masks(str(feature), values)
+        finite_valid &= np.isfinite(shap_values)
+        axis.scatter(
+            values[finite_valid],
+            shap_values[finite_valid],
+            c=result.prediction[finite_valid],
+            cmap="viridis",
+            s=13,
+            alpha=0.55,
+            linewidths=0,
+            rasterized=True,
+        )
+        axis.axhline(0.0, color="#555555", linewidth=0.8, alpha=0.6)
+        axis.set_xlabel(
+            display_feature_label(str(feature)),
+            fontsize=PLOT_AXIS_LABEL_FONT_SIZE,
+            fontweight="bold",
+        )
+        axis.set_ylabel(
+            "SHAP value",
+            fontsize=PLOT_AXIS_LABEL_FONT_SIZE,
+            fontweight="bold",
+        )
+        _set_dependence_endpoint_ticks(
+            axis,
+            values[finite_valid],
+            shap_values[finite_valid],
+        )
+        _apply_paper_axis_style(axis)
+    for axis in flat_axes[len(selected) :]:
+        axis.set_visible(False)
+    figure.savefig(destination, dpi=300, bbox_inches="tight")
+    plt.close(figure)
+
+
+def _plot_measured_vs_predicted(
+    result: OOFShapResult,
+    dataset: TargetDataset,
+    target: str,
+    destination: Path,
+) -> None:
+    measured = np.asarray(dataset.target, dtype=float)
+    predicted = np.asarray(result.prediction, dtype=float)
+    lower = float(min(measured.min(), predicted.min()))
+    upper = float(max(measured.max(), predicted.max()))
+    padding = 0.03 * max(upper - lower, 1.0)
+    figure, axis = plt.subplots(figsize=(7.6, 7.1), constrained_layout=True)
+    axis.scatter(
+        measured,
+        predicted,
+        c=np.abs(measured - predicted),
+        cmap="magma_r",
+        s=18,
+        alpha=0.62,
+        linewidths=0,
+        rasterized=True,
+    )
+    axis.plot(
+        [lower - padding, upper + padding],
+        [lower - padding, upper + padding],
+        color="#222222",
+        linestyle="--",
+        linewidth=1.3,
+    )
+    axis.set_xlim(lower - padding, upper + padding)
+    axis.set_ylim(lower - padding, upper + padding)
+    label, unit = _target_label(target)
+    suffix = f" ({unit})" if unit else ""
+    axis.set_xlabel(f"Measured {label}{suffix}")
+    axis.set_ylabel(f"Mean OOF prediction{suffix}")
+    metrics = result.ensemble_metrics
+    axis.text(
+        0.04,
+        0.96,
+        f"R2 = {metrics['r2']:.4f}\nRMSE = {metrics['rmse']:.4f}\nMAE = {metrics['mae']:.4f}",
+        transform=axis.transAxes,
+        ha="left",
+        va="top",
+        bbox={"boxstyle": "round,pad=0.35", "facecolor": "white", "alpha": 0.82},
+    )
+    axis.set_title(f"{label}: 50-model ensemble OOF prediction")
+    axis.grid(alpha=0.18)
+    figure.savefig(destination, dpi=300, bbox_inches="tight")
+    plt.close(figure)
+
+
+def _style_excel_workbook(writer: pd.ExcelWriter) -> None:
+    for worksheet in writer.book.worksheets:
+        worksheet.freeze_panes = "A2"
+        worksheet.auto_filter.ref = worksheet.dimensions
+        worksheet.sheet_view.showGridLines = False
+        for cell in worksheet[1]:
+            header_font = copy(cell.font)
+            header_font.bold = True
+            cell.font = header_font
+        for column_cells in worksheet.iter_cols(
+            min_col=1,
+            max_col=min(worksheet.max_column, 20),
+            min_row=1,
+            max_row=min(worksheet.max_row, 200),
+        ):
+            width = min(
+                42,
+                max(10, max(len(str(cell.value)) if cell.value is not None else 0 for cell in column_cells) + 2),
+            )
+            worksheet.column_dimensions[column_cells[0].column_letter].width = width
+
+
+def export_analysis(
+    result: OOFShapResult,
+    dataset: TargetDataset,
+    config: TargetConfig,
+) -> dict[str, Any]:
+    output_dir = Path(config.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    importance = build_global_importance(result, dataset)
+    plot_range_audit = build_plot_range_audit(dataset)
+    feature_names = dataset.manifest["feature"].astype(str).tolist()
+    seeds = result.seed_metrics["seed"].astype(int).tolist()
+    prediction_table = pd.DataFrame(
+        {
+            "source_index_zero_based": dataset.source_indices,
+            "original_excel_row": dataset.excel_rows,
+            "measured": dataset.target,
+            "mean_oof_prediction": result.prediction,
+            "std_oof_prediction_across_seeds": result.prediction_std,
+            "residual_measured_minus_predicted": dataset.target - result.prediction,
+            "absolute_error": np.abs(dataset.target - result.prediction),
+            "mean_base_value": result.base_value,
+            "oof_explanation_count": result.coverage,
+        }
+    )
+    for seed_index, seed in enumerate(seeds):
+        prediction_table[f"oof_prediction_seed_{seed}"] = result.seed_predictions[seed_index]
+    shap_table = pd.DataFrame(
+        result.shap_values,
+        columns=[f"SHAP::{name}" for name in feature_names],
+    )
+    shap_table.insert(0, "original_excel_row", dataset.excel_rows)
+    value_table = dataset.features.copy()
+    value_table.columns = [f"VALUE::{name}" for name in feature_names]
+    value_table.insert(0, "original_excel_row", dataset.excel_rows)
+    reconstructed = result.base_value + result.shap_values.sum(axis=1)
+    additivity_table = pd.DataFrame(
+        {
+            "original_excel_row": dataset.excel_rows,
+            "mean_oof_prediction": result.prediction,
+            "mean_base_value": result.base_value,
+            "sum_mean_shap": result.shap_values.sum(axis=1),
+            "reconstructed_prediction": reconstructed,
+            "absolute_additivity_error": np.abs(result.prediction - reconstructed),
+        }
+    )
+
+    route_counts = dataset.manifest["route"].value_counts().to_dict()
+    summary: dict[str, Any] = {
+        "target": config.target,
+        "sample_count": int(len(dataset.target)),
+        "feature_count": int(dataset.features.shape[1]),
+        "base_feature_count": int(route_counts.get("base", 0)),
+        "physical_feature_count": int(route_counts.get("physical", 0)),
+        "phase_feature_count": int(route_counts.get("phase", 0)),
+        "model_count": int(len(result.model_registry)),
+        "cv_seeds": seeds,
+        "fold_count_per_seed": int(result.model_registry["fold"].nunique()),
+        "oof_explanations_per_row": int(result.coverage[0]),
+        "ensemble_oof_r2": float(result.ensemble_metrics["r2"]),
+        "ensemble_oof_rmse": float(result.ensemble_metrics["rmse"]),
+        "ensemble_oof_mae": float(result.ensemble_metrics["mae"]),
+        **result.mean_seed_metrics,
+        "maximum_oof_shap_additivity_error": float(result.max_additivity_error),
+        "shap_method": "LightGBM native TreeSHAP pred_contrib=True",
+        "model_source_directory": str(Path(config.model_source_dir).resolve()),
+        "models_retrained_by_shap_analysis": False,
+        "labelled_data_explanation": "validation-only OOF; one explanation per seed",
+        "future_data_explanation": "mean prediction and mean SHAP across all saved fold models",
+        "full_data_model_trained": False,
+        "plot_range_rules": {
+            "phase_*_volume_pct": list(VOLUME_FRACTION_PLOT_RANGE),
+        },
+        "plot_range_exclusion_count": int(len(plot_range_audit)),
+        "plot_range_exclusion_count_by_feature": {
+            str(feature): int(count)
+            for feature, count in plot_range_audit["feature"].value_counts().items()
+        },
+        "plot_filter_scope": (
+            "Out-of-range values are excluded only from the corresponding beeswarm "
+            "and dependence plot; predictions, metrics, importance, and exported SHAP "
+            "values remain complete."
+        ),
+        "selection_cv_warning": (
+            "Frozen features were selected using the same CV family. OOF SHAP prevents each "
+            "row from being explained by a model trained on that row, but does not remove "
+            "earlier feature-selection bias."
+        ),
+    }
+    run_summary_table = pd.DataFrame(
+        {"item": list(summary.keys()), "value": [json.dumps(value, ensure_ascii=False) if isinstance(value, (list, dict)) else value for value in summary.values()]}
+    )
+
+    result.model_registry.to_csv(
+        output_dir / "model_registry.csv", index=False, encoding="utf-8-sig"
+    )
+    plot_range_audit.to_csv(
+        output_dir / "plot_range_audit.csv", index=False, encoding="utf-8-sig"
+    )
+    dataset.manifest.to_csv(
+        output_dir / "feature_manifest.csv", index=False, encoding="utf-8-sig"
+    )
+    (output_dir / "feature_manifest.json").write_text(
+        json.dumps(
+            {
+                "target": config.target,
+                "feature_count": len(dataset.manifest),
+                "features": dataset.manifest.to_dict(orient="records"),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (output_dir / "run_summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    workbook_path = output_dir / "shap_analysis.xlsx"
+    with pd.ExcelWriter(workbook_path, engine="openpyxl") as writer:
+        run_summary_table.to_excel(writer, sheet_name="run_summary", index=False)
+        importance.to_excel(writer, sheet_name="global_importance", index=False)
+        prediction_table.to_excel(writer, sheet_name="oof_predictions", index=False)
+        shap_table.to_excel(writer, sheet_name="oof_shap", index=False)
+        value_table.to_excel(writer, sheet_name="feature_values", index=False)
+        result.model_registry.to_excel(writer, sheet_name="model_registry", index=False)
+        result.seed_metrics.to_excel(writer, sheet_name="seed_metrics", index=False)
+        additivity_table.to_excel(writer, sheet_name="additivity_check", index=False)
+        dataset.manifest.to_excel(writer, sheet_name="feature_manifest", index=False)
+        plot_range_audit.to_excel(writer, sheet_name="plot_range_audit", index=False)
+        _style_excel_workbook(writer)
+
+    _plot_global_bar(
+        importance, config.target, output_dir / "shap_global_importance_bar.png"
+    )
+    _plot_beeswarm(
+        result,
+        dataset,
+        importance,
+        config.target,
+        output_dir / "shap_global_beeswarm.png",
+    )
+    _plot_dependence_panels(
+        result,
+        dataset,
+        importance,
+        config.target,
+        output_dir / "shap_feature_dependence.png",
+    )
+    _plot_measured_vs_predicted(
+        result,
+        dataset,
+        config.target,
+        output_dir / "oof_measured_vs_predicted.png",
+    )
+    return summary
+
+
+def predict_saved_ensemble(
+    result_dir: Path | str,
+    prepared_features: pd.DataFrame,
+    model_source_dir: Path | str | None = None,
+) -> SavedEnsemblePrediction:
+    directory = Path(result_dir)
+    manifest_path = directory / "feature_manifest.csv"
+    registry_directory = (
+        Path(model_source_dir) if model_source_dir is not None else directory
+    )
+    registry_path = registry_directory / "model_registry.csv"
+    if not manifest_path.exists():
+        raise FileNotFoundError(manifest_path)
+    if not registry_path.exists():
+        raise FileNotFoundError(registry_path)
+    manifest = pd.read_csv(manifest_path)
+    required_manifest_columns = {"feature", "model_feature", "position"}
+    missing_manifest = required_manifest_columns.difference(manifest.columns)
+    if missing_manifest:
+        raise KeyError(f"feature manifest is missing columns: {sorted(missing_manifest)}")
+    manifest = manifest.sort_values("position")
+    feature_names = manifest["feature"].astype(str).tolist()
+    model_names = manifest["model_feature"].astype(str).tolist()
+    validated = validate_prediction_schema(prepared_features, feature_names)
+    model_frame = validated.copy()
+    model_frame.columns = model_names
+    registry = pd.read_csv(registry_path)
+    if "model_path" not in registry.columns or registry.empty:
+        raise ValueError("model registry does not contain saved models")
+
+    predictions: list[np.ndarray] = []
+    contributions: list[np.ndarray] = []
+    for raw_path in registry["model_path"].astype(str):
+        model_path = _resolve_registered_model_path(raw_path, registry_directory)
+        artifact = joblib.load(model_path)
+        if [str(value) for value in artifact.get("feature_names", [])] != feature_names:
+            raise ValueError(f"saved model feature order mismatch: {model_path}")
+        if [str(value) for value in artifact.get("model_feature_names", [])] != model_names:
+            raise ValueError(f"saved model internal feature order mismatch: {model_path}")
+        model = artifact["model"]
+        prediction = np.asarray(model.predict(model_frame), dtype=float)
+        contribution = np.asarray(
+            model.predict(model_frame, pred_contrib=True), dtype=float
+        )
+        predictions.append(prediction)
+        contributions.append(contribution)
+    prediction_matrix = np.stack(predictions, axis=0)
+    contribution_cube = np.stack(contributions, axis=0)
+    aggregate = aggregate_prediction_contributions(
+        prediction_matrix,
+        contribution_cube,
+    )
+    return SavedEnsemblePrediction(
+        prediction=aggregate.prediction,
+        prediction_std=prediction_matrix.std(axis=0, ddof=0),
+        shap_values=aggregate.shap_values,
+        base_value=aggregate.base_value,
+        max_additivity_error=aggregate.max_additivity_error,
+        model_count=prediction_matrix.shape[0],
+    )
+
+
+def run_target_analysis(config: TargetConfig) -> dict[str, Any]:
+    dataset = build_target_dataset(config)
+    result = load_oof_shap_from_saved_models(dataset, config)
+    summary = export_analysis(result, dataset, config)
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return summary
